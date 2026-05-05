@@ -298,7 +298,7 @@ function fitMap() {
   updateZoomLabel();
 }
 
-setMapStatus('loading', 'Loading TrackGen NxtGen map…');
+setMapStatus('loading', 'Loading map…');
 mapImg.src = MAP_URL;
 
 let lastZoomText = '';
