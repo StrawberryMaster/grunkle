@@ -257,7 +257,7 @@ function zoomMapAt(screenX, screenY, zoomFactor) {
 
 mapImg.onload = () => {
   S.mapLoaded = true;
-  setMapStatus('loaded', `Loaded Base · ${mapImg.naturalWidth}×${mapImg.naturalHeight}`);
+  setMapStatus('loaded', `Loaded base · ${mapImg.naturalWidth}×${mapImg.naturalHeight}`);
   mapBaseW = mapImg.naturalWidth;
   mapBaseH = mapImg.naturalHeight;
   fitMap();
