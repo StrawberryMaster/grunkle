@@ -1,8 +1,4 @@
-/**
- * Image Processing Web Worker
- * Offloads CPU-intensive pixel processing to a background thread
- */
-
+// The web worker
 self.onmessage = (event) => {
   const { imageData, config } = event.data;
   if (!imageData) return;
@@ -19,7 +15,7 @@ self.onmessage = (event) => {
   const feather = Math.max(1, config.alphaFeather);
   const invFeather = 1 / feather;
 
-  // Build Levels LUT
+  // build levels LUT
   const useLevels = (lvMin !== 0 || lvMax !== 255 || lvGam !== 1.0);
   let lut;
   if (useLevels) {
@@ -36,7 +32,7 @@ self.onmessage = (event) => {
     }
   }
 
-  // Process pixels
+  // process pixels
   for (let i = 0; i < n; i += 4) {
     let r = d[i], g = d[i+1], b = d[i+2];
 
@@ -71,6 +67,6 @@ self.onmessage = (event) => {
     d[i] = r; d[i+1] = g; d[i+2] = b;
   }
 
-  // Send processed data back
+  // send processed data back
   self.postMessage({ imageData });
 };

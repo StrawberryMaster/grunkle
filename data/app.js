@@ -136,7 +136,7 @@ resize();
 /* ──────────────────────────────────────────────────────────────
    MAP LOADING
 ────────────────────────────────────────────────────────────── */
-const MAP_URL = '../files/bg21600-nxtgen.jpg';
+const MAP_URL = './files/bg21600-nxtgen.jpg';
 
 const mapStatus = document.getElementById('map-status');
 const badgeMap = document.getElementById('badge-map');
