@@ -11,6 +11,7 @@ self.onmessage = (event) => {
   const lvGam   = config.levelsGamma;
   const lvMax   = config.levelsMax;
   const doC2A   = config.c2a;
+  const doCErase= config.cErase;
   const thresh  = config.alphaThresh;
   const feather = Math.max(1, config.alphaFeather);
   const invFeather = 1 / feather;
@@ -45,7 +46,22 @@ self.onmessage = (event) => {
       r = g = b = lum;
     }
 
-    if (doC2A) {
+    if (doCErase) {
+      let brightness = r;
+      if (g > brightness) brightness = g;
+      if (b > brightness) brightness = b;
+      
+      const alphaFactor = brightness / 255;
+      d[i+3] = (alphaFactor * d[i+3]) | 0;
+      if (alphaFactor > 0) {
+        const norm = 1 / alphaFactor;
+        r = Math.min(255, r * norm) | 0;
+        g = Math.min(255, g * norm) | 0;
+        b = Math.min(255, b * norm) | 0;
+      } else {
+        r = g = b = 0;
+      }
+    } else if (doC2A) {
       let brightness = r;
       if (g > brightness) brightness = g;
       if (b > brightness) brightness = b;

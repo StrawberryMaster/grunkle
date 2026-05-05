@@ -498,6 +498,33 @@ input[type=range]:disabled {
     transition: transform 0.2s, background 0.2s;
 }
 
+/* ─── HELP ICON ─── */
+.help-icon {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 14px;
+    height: 14px;
+    border-radius: 50%;
+    background: var(--bg3);
+    color: var(--text-muted);
+    font-size: 9px;
+    font-weight: bold;
+    cursor: help;
+    margin-left: 4px;
+    border: 1px solid var(--border-hi);
+    vertical-align: middle;
+    transition: all 0.2s;
+    font-family: var(--font-ui);
+}
+
+.help-icon:hover {
+    background: var(--accent);
+    color: var(--bg0);
+    border-color: var(--accent);
+}
+
+
 .toggle input:checked+.toggle-track::after {
     transform: translateX(18px);
     background: var(--accent);

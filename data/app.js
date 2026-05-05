@@ -40,7 +40,7 @@ const S = {
   mapLoaded: false, stormLoaded: false,
   stormX: 0, stormY: 0, stormScale: 50, stormRotation: 0,
   flipH: false, flipV: false, opacity: 1.0, blendMode: 'source-over',
-  desaturate: true, c2a: true, alphaThresh: 30, alphaFeather: 80,
+  desaturate: true, c2a: true, cErase: false, alphaThresh: 30, alphaFeather: 80,
   levelsMin: 0, levelsGamma: 1.0, levelsMax: 255,
   mapOffX: 0, mapOffY: 0, mapZoom: 1.0,
   dragging: false, dragMode: null,
@@ -402,6 +402,7 @@ function processStorm() {
         levelsGamma: S.levelsGamma,
         levelsMax: S.levelsMax,
         c2a: S.c2a,
+        cErase: S.cErase,
         alphaThresh: S.alphaThresh,
         alphaFeather: S.alphaFeather
       }
@@ -419,6 +420,7 @@ function processPixelsMainThread(imgData) {
   const lvGam = S.levelsGamma;
   const lvMax = S.levelsMax;
   const doC2A = S.c2a;
+  const doCErase = S.cErase;
   const thresh = S.alphaThresh;
   const feather = Math.max(1, S.alphaFeather);
   const invFeather = 1 / feather;
@@ -443,7 +445,23 @@ function processPixelsMainThread(imgData) {
     let r = d[i], g = d[i + 1], b = d[i + 2];
     if (useLevels) { r = lut[r]; g = lut[g]; b = lut[b]; }
     if (desat) { const lum = (54 * r + 183 * g + 19 * b) >> 8; r = g = b = lum; }
-    if (doC2A) {
+    
+    if (doCErase) {
+      let brightness = r;
+      if (g > brightness) brightness = g;
+      if (b > brightness) brightness = b;
+      
+      const alphaFactor = brightness / 255;
+      d[i+3] = (alphaFactor * d[i+3]) | 0;
+      if (alphaFactor > 0) {
+        const norm = 1 / alphaFactor;
+        r = Math.min(255, r * norm) | 0;
+        g = Math.min(255, g * norm) | 0;
+        b = Math.min(255, b * norm) | 0;
+      } else {
+        r = g = b = 0;
+      }
+    } else if (doC2A) {
       let brightness = r;
       if (g > brightness) brightness = g;
       if (b > brightness) brightness = b;
@@ -730,12 +748,14 @@ wireProc('sl-lvl-max', 'levelsMax', null, 'val-lvl-max', v => Math.round(v));
 
 document.getElementById('chk-desat').addEventListener('change', e => { S.desaturate = e.target.checked; if (S.stormLoaded) processStorm(); });
 document.getElementById('chk-c2a').addEventListener('change', e => { S.c2a = e.target.checked; if (S.stormLoaded) processStorm(); });
+document.getElementById('chk-cerase').addEventListener('change', e => { S.cErase = e.target.checked; if (S.stormLoaded) processStorm(); });
 document.getElementById('btn-apply').addEventListener('click', () => { if (S.stormLoaded) processStorm(); });
 
 document.getElementById('btn-reset-proc').addEventListener('click', () => {
-  S.desaturate = true; S.c2a = true; S.alphaThresh = 30; S.alphaFeather = 80;
+  S.desaturate = true; S.c2a = true; S.cErase = false; S.alphaThresh = 30; S.alphaFeather = 80;
   S.levelsMin = 0; S.levelsGamma = 1.0; S.levelsMax = 255;
   ['chk-desat', 'chk-c2a'].forEach(id => document.getElementById(id).checked = true);
+  document.getElementById('chk-cerase').checked = false;
   setSlider('sl-alpha-thresh', 30, 'val-alpha-thresh', '30');
   setSlider('sl-alpha-feather', 80, 'val-alpha-feather', '80');
   setSlider('sl-lvl-min', 0, 'val-lvl-min', '0');
