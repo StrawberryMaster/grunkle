@@ -842,8 +842,8 @@ function renderCompositeToCanvas(ctx, targetW, targetH) {
 
   // calculate scale and center
   const scale = targetW / W;
-  const scaledCenterX = (S.stormX || W / 2) * scale;
-  const scaledCenterY = (S.stormY || H / 2) * scale;
+  const scaledCenterX = (S.stormX !== undefined ? S.stormX : W / 2) * scale;
+  const scaledCenterY = (S.stormY !== undefined ? S.stormY : H / 2) * scale;
 
   // render map at full resolution
   if (S.mapLoaded && (mapImg.src || fallbackCanvas)) {
