@@ -842,20 +842,21 @@ function renderCompositeToCanvas(ctx, targetW, targetH) {
 
   // calculate scale and center
   const scale = targetW / W;
-  const scaledCenterX = (S.stormX !== undefined ? S.stormX : W / 2) * scale;
-  const scaledCenterY = (S.stormY !== undefined ? S.stormY : H / 2) * scale;
+  const offsetX = (targetW - W * scale) / 2;
+  const offsetY = (targetH - H * scale) / 2;
+  const scaledCenterX = offsetX + (S.stormX !== undefined ? S.stormX : W / 2) * scale;
+  const scaledCenterY = offsetY + (S.stormY !== undefined ? S.stormY : H / 2) * scale;
 
   // render map at full resolution
   if (S.mapLoaded && (mapImg.src || fallbackCanvas)) {
     const mapSource = fallbackCanvas || mapImg;
     const mapW = mapBaseW || (fallbackCanvas ? fallbackCanvas.width : mapImg.naturalWidth);
     const mapH = mapBaseH || (fallbackCanvas ? fallbackCanvas.height : mapImg.naturalHeight);
-    const scaledMapW = mapW * scale;
-    const scaledMapH = mapH * scale;
+    const scaledMapW = mapW * S.mapZoom * scale;
+    const scaledMapH = mapH * S.mapZoom * scale;
 
-    // center the map
-    const mapOffsetX = (targetW - scaledMapW) / 2;
-    const mapOffsetY = (targetH - scaledMapH) / 2;
+    const mapOffsetX = offsetX + S.mapOffX * scale;
+    const mapOffsetY = offsetY + S.mapOffY * scale;
 
     // draw map tiled if needed
     let drawX = mapOffsetX % scaledMapW;
@@ -867,8 +868,8 @@ function renderCompositeToCanvas(ctx, targetW, targetH) {
       const destW = destRight - destX;
 
       if (destW > 0) {
-        const srcX = (destX - drawX) / scale;
-        const srcW = destW / scale;
+        const srcX = (destX - drawX) / (S.mapZoom * scale);
+        const srcW = destW / (S.mapZoom * scale);
         ctx.drawImage(mapSource, srcX, 0, srcW, mapH, destX, mapOffsetY, destW, scaledMapH);
       }
     }
