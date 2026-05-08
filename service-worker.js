@@ -1,12 +1,12 @@
 const CACHE_NAME = 'grunkle-v1';
 const CORE_ASSETS = [
-  '/',
-  '/index.html',
-  '/data/app.js',
-  '/data/grunkle.css',
-  '/data/worker-process.js',
-  '/files/bg21600-nxtgen.jpg',
-  '/files/grunkle.png'
+  './',
+  './index.html',
+  './data/app.js',
+  './data/grunkle.css',
+  './data/worker-process.js',
+  './files/bg21600-nxtgen.jpg',
+  './files/grunkle.png'
 ];
 
 self.addEventListener('install', (event) => {
@@ -41,12 +41,12 @@ self.addEventListener('fetch', (event) => {
         const copy = res.clone();
         caches.open(CACHE_NAME).then((cache) => cache.put(event.request, copy));
         return res;
-      }).catch(() => caches.match('/index.html'))
+      }).catch(() => caches.match('./index.html'))
     );
     return;
   }
 
-  if (url.pathname.startsWith('/files/') || /\.(png|jpg|jpeg|webp|gif|svg)$/.test(url.pathname)) {
+  if (url.pathname.includes('/files/') || /\.(png|jpg|jpeg|webp|gif|svg)$/.test(url.pathname)) {
     event.respondWith(
       caches.match(event.request).then((cached) => cached || fetch(event.request).then((res) => {
         const copy = res.clone();
