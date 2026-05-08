@@ -1,0 +1,17 @@
+{
+  "name": "grunkle",
+  "short_name": "grunkle",
+  "description": "Generate and plot satellite/storm images on a map",
+  "start_url": ".",
+  "display": "standalone",
+  "background_color": "#ffffff",
+  "theme_color": "#d90f2b",
+  "icons": [
+    {
+      "src": "./files/grunkle.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any maskable"
+    }
+  ]
+}
