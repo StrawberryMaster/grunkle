@@ -1,5 +1,58 @@
 // The web worker
-self.onmessage = (event) => {
+self.onmessage = async (event) => {
+  if (event.data.type === 'export') {
+    const { 
+      targetW, targetH, bg2,
+      scale, offsetX, offsetY, scaledCenterX, scaledCenterY,
+      mapBitmap, mapW, mapH, scaledMapW, scaledMapH, mapZoom, mapOffX, mapOffY,
+      stormBitmap, renderedW, renderedH, opacity, blendMode, stormRotation, flipH, flipV,
+      mime, quality
+    } = event.data;
+
+    const exportCanvas = new OffscreenCanvas(targetW, targetH);
+    const ctx = exportCanvas.getContext('2d');
+
+    ctx.fillStyle = bg2;
+    ctx.fillRect(0, 0, targetW, targetH);
+
+    if (mapBitmap) {
+      const mapOffsetX = offsetX + mapOffX * scale;
+      const mapOffsetY = offsetY + mapOffY * scale;
+      let drawX = mapOffsetX % scaledMapW;
+      if (drawX > 0) drawX -= scaledMapW;
+
+      for (; drawX < targetW; drawX += scaledMapW) {
+        const destX = Math.max(0, drawX);
+        const destRight = Math.min(targetW, drawX + scaledMapW);
+        const destW = destRight - destX;
+
+        if (destW > 0) {
+          const srcX = (destX - drawX) / (mapZoom * scale);
+          const srcW = destW / (mapZoom * scale);
+          ctx.drawImage(mapBitmap, srcX, 0, srcW, mapH, destX, mapOffsetY, destW, scaledMapH);
+        }
+      }
+    }
+
+    if (stormBitmap) {
+      const scaledRenderedW = renderedW * scale;
+      const scaledRenderedH = renderedH * scale;
+
+      ctx.save();
+      ctx.globalAlpha = opacity;
+      ctx.globalCompositeOperation = blendMode;
+      ctx.translate(scaledCenterX, scaledCenterY);
+      ctx.rotate(stormRotation * Math.PI / 180);
+      ctx.scale(flipH ? -1 : 1, flipV ? -1 : 1);
+      ctx.drawImage(stormBitmap, -scaledRenderedW / 2, -scaledRenderedH / 2, scaledRenderedW, scaledRenderedH);
+      ctx.restore();
+    }
+
+    const blob = await exportCanvas.convertToBlob({ type: mime, quality });
+    self.postMessage({ type: 'export_done', blob });
+    return;
+  }
+
   const { imageData, config } = event.data;
   if (!imageData) return;
 
@@ -34,37 +87,41 @@ self.onmessage = (event) => {
   }
 
   // process pixels
-  for (let i = 0; i < n; i += 4) {
-    let r = d[i], g = d[i+1], b = d[i+2];
-
-    if (useLevels) {
-      r = lut[r]; g = lut[g]; b = lut[b];
+  if (useLevels) {
+    for (let i = 0; i < n; i += 4) {
+      d[i]   = lut[d[i]];
+      d[i+1] = lut[d[i+1]];
+      d[i+2] = lut[d[i+2]];
     }
+  }
 
-    if (desat) {
-      const lum = (54 * r + 183 * g + 19 * b) >> 8;
-      r = g = b = lum;
+  if (desat) {
+    for (let i = 0; i < n; i += 4) {
+      const lum = (54 * d[i] + 183 * d[i+1] + 19 * d[i+2]) >> 8;
+      d[i] = d[i+1] = d[i+2] = lum;
     }
+  }
 
-    if (doCErase) {
-      let brightness = r;
-      if (g > brightness) brightness = g;
-      if (b > brightness) brightness = b;
+  if (doCErase) {
+    for (let i = 0; i < n; i += 4) {
+      let r = d[i], g = d[i+1], b = d[i+2];
+      let brightness = r > g ? (r > b ? r : b) : (g > b ? g : b);
       
       const alphaFactor = brightness / 255;
       d[i+3] = (alphaFactor * d[i+3]) | 0;
       if (alphaFactor > 0) {
         const norm = 1 / alphaFactor;
-        r = Math.min(255, r * norm) | 0;
-        g = Math.min(255, g * norm) | 0;
-        b = Math.min(255, b * norm) | 0;
+        d[i]   = Math.min(255, r * norm) | 0;
+        d[i+1] = Math.min(255, g * norm) | 0;
+        d[i+2] = Math.min(255, b * norm) | 0;
       } else {
-        r = g = b = 0;
+        d[i] = d[i+1] = d[i+2] = 0;
       }
-    } else if (doC2A) {
-      let brightness = r;
-      if (g > brightness) brightness = g;
-      if (b > brightness) brightness = b;
+    }
+  } else if (doC2A) {
+    for (let i = 0; i < n; i += 4) {
+      let r = d[i], g = d[i+1], b = d[i+2];
+      let brightness = r > g ? (r > b ? r : b) : (g > b ? g : b);
       
       if (brightness <= thresh) {
         d[i+3] = 0;
@@ -73,16 +130,14 @@ self.onmessage = (event) => {
         d[i+3] = (alphaFactor * 255) | 0;
         if (alphaFactor > 0) {
           const norm = 1 / alphaFactor;
-          r = Math.min(255, r * norm) | 0;
-          g = Math.min(255, g * norm) | 0;
-          b = Math.min(255, b * norm) | 0;
+          d[i]   = Math.min(255, r * norm) | 0;
+          d[i+1] = Math.min(255, g * norm) | 0;
+          d[i+2] = Math.min(255, b * norm) | 0;
         }
       }
     }
-
-    d[i] = r; d[i+1] = g; d[i+2] = b;
   }
 
   // send processed data back
-  self.postMessage({ imageData });
+  self.postMessage({ imageData }, [imageData.data.buffer]);
 };

@@ -26,10 +26,16 @@ let processingWorker = null;
 let isProcessing = false;
 let procStartTime = 0;
 
+let activeExportResolve = null;
+
 // initialize web worker for offloading pixel processing
 try {
   processingWorker = new Worker('./data/worker-process.js');
   processingWorker.onmessage = (event) => {
+    if (event.data.type === 'export_done') {
+      if (activeExportResolve) activeExportResolve(event.data.blob);
+      return;
+    }
     const { imageData } = event.data;
     offCtx.putImageData(imageData, 0, 0);
     processedStorm = offscreen;
@@ -45,7 +51,7 @@ try {
   console.warn('Web Worker not available, using main thread:', e);
 }
 
-const S = {
+const rawState = {
   mapLoaded: false, stormLoaded: false,
   stormX: 0, stormY: 0, stormScale: 50, stormRotation: 0,
   flipH: false, flipV: false, opacity: 1.0, blendMode: 'source-over',
@@ -57,6 +63,17 @@ const S = {
   dirty: true, perfProc: 0, perfRend: 0,
   renderedW: 0, renderedH: 0
 };
+
+const S = new Proxy(rawState, {
+  set(target, prop, value) {
+    if (target[prop] === value) return true;
+    target[prop] = value;
+    if (prop !== 'dirty' && !prop.startsWith('perf') && !prop.startsWith('drag')) {
+      target.dirty = true;
+    }
+    return true;
+  }
+});
 
 const UI = {
   numSx: document.getElementById('num-sx'),
@@ -186,32 +203,45 @@ function buildMapMipLevelsAsync(baseSource, baseW, baseH) {
     }
   };
 
-  const step = (deadline) => {
+  const step = async () => {
     if (token !== mapMipBuildToken) return;
-    const hasBudget = () => !deadline || deadline.timeRemaining() > 3;
-
-    while (hasBudget() && Math.min(prevW, prevH) > MIN_DIM) {
-      const nextW = Math.max(MIN_DIM, Math.floor(prevW / 2));
-      const nextH = Math.max(MIN_DIM, Math.floor(prevH / 2));
-      if (nextW === prevW && nextH === prevH) break;
-
-      const levelCanvas = document.createElement('canvas');
-      levelCanvas.width = nextW;
-      levelCanvas.height = nextH;
-      const levelCtx = levelCanvas.getContext('2d', { alpha: false });
-      levelCtx.imageSmoothingEnabled = true;
-      levelCtx.imageSmoothingQuality = 'high';
-      levelCtx.drawImage(prevSource, 0, 0, nextW, nextH);
-
-      const factor = nextW / baseW;
-      mapMipLevels.push({ source: levelCanvas, width: nextW, height: nextH, factor, ownsSource: false });
-      prevSource = levelCanvas;
-      prevW = nextW;
-      prevH = nextH;
-    }
 
     if (Math.min(prevW, prevH) > MIN_DIM) {
-      schedule(step);
+      const nextW = Math.max(MIN_DIM, Math.floor(prevW / 2));
+      const nextH = Math.max(MIN_DIM, Math.floor(prevH / 2));
+      if (nextW === prevW && nextH === prevH) return;
+
+      try {
+        let nextSource;
+        if (typeof createImageBitmap === 'function') {
+          nextSource = await createImageBitmap(prevSource, {
+            resizeWidth: nextW,
+            resizeHeight: nextH,
+            resizeQuality: 'high'
+          });
+        } else {
+          const levelCanvas = document.createElement('canvas');
+          levelCanvas.width = nextW;
+          levelCanvas.height = nextH;
+          const levelCtx = levelCanvas.getContext('2d', { alpha: false });
+          levelCtx.imageSmoothingEnabled = true;
+          levelCtx.imageSmoothingQuality = 'high';
+          levelCtx.drawImage(prevSource, 0, 0, nextW, nextH);
+          nextSource = levelCanvas;
+        }
+
+        const factor = nextW / baseW;
+        mapMipLevels.push({ source: nextSource, width: nextW, height: nextH, factor, ownsSource: true });
+        prevSource = nextSource;
+        prevW = nextW;
+        prevH = nextH;
+
+        schedule(step);
+      } catch (err) {
+        console.warn('Failed to generate map mip level:', err);
+      }
+    } else {
+      S.dirty = true;
     }
   };
 
@@ -415,7 +445,7 @@ function processStorm() {
         alphaThresh: S.alphaThresh,
         alphaFeather: S.alphaFeather
       }
-    });
+    }, [imgData.data.buffer]);
   } else {
     processPixelsMainThread(imgData);
   }
@@ -450,30 +480,41 @@ function processPixelsMainThread(imgData) {
     }
   }
 
-  for (let i = 0; i < n; i += 4) {
-    let r = d[i], g = d[i + 1], b = d[i + 2];
-    if (useLevels) { r = lut[r]; g = lut[g]; b = lut[b]; }
-    if (desat) { const lum = (54 * r + 183 * g + 19 * b) >> 8; r = g = b = lum; }
-    
-    if (doCErase) {
-      let brightness = r;
-      if (g > brightness) brightness = g;
-      if (b > brightness) brightness = b;
+  if (useLevels) {
+    for (let i = 0; i < n; i += 4) {
+      d[i]   = lut[d[i]];
+      d[i+1] = lut[d[i+1]];
+      d[i+2] = lut[d[i+2]];
+    }
+  }
+
+  if (desat) {
+    for (let i = 0; i < n; i += 4) {
+      const lum = (54 * d[i] + 183 * d[i+1] + 19 * d[i+2]) >> 8;
+      d[i] = d[i+1] = d[i+2] = lum;
+    }
+  }
+
+  if (doCErase) {
+    for (let i = 0; i < n; i += 4) {
+      let r = d[i], g = d[i+1], b = d[i+2];
+      let brightness = r > g ? (r > b ? r : b) : (g > b ? g : b);
       
       const alphaFactor = brightness / 255;
       d[i+3] = (alphaFactor * d[i+3]) | 0;
       if (alphaFactor > 0) {
         const norm = 1 / alphaFactor;
-        r = Math.min(255, r * norm) | 0;
-        g = Math.min(255, g * norm) | 0;
-        b = Math.min(255, b * norm) | 0;
+        d[i]   = Math.min(255, r * norm) | 0;
+        d[i+1] = Math.min(255, g * norm) | 0;
+        d[i+2] = Math.min(255, b * norm) | 0;
       } else {
-        r = g = b = 0;
+        d[i] = d[i+1] = d[i+2] = 0;
       }
-    } else if (doC2A) {
-      let brightness = r;
-      if (g > brightness) brightness = g;
-      if (b > brightness) brightness = b;
+    }
+  } else if (doC2A) {
+    for (let i = 0; i < n; i += 4) {
+      let r = d[i], g = d[i+1], b = d[i+2];
+      let brightness = r > g ? (r > b ? r : b) : (g > b ? g : b);
       if (brightness <= thresh) {
         d[i + 3] = 0;
       } else if (brightness < thresh + feather) {
@@ -481,13 +522,12 @@ function processPixelsMainThread(imgData) {
         d[i + 3] = (alphaFactor * 255) | 0;
         if (alphaFactor > 0) {
           const norm = 1 / alphaFactor;
-          r = Math.min(255, r * norm) | 0;
-          g = Math.min(255, g * norm) | 0;
-          b = Math.min(255, b * norm) | 0;
+          d[i]   = Math.min(255, r * norm) | 0;
+          d[i+1] = Math.min(255, g * norm) | 0;
+          d[i+2] = Math.min(255, b * norm) | 0;
         }
       }
     }
-    d[i] = r; d[i + 1] = g; d[i + 2] = b;
   }
 
   offCtx.putImageData(imgData, 0, 0);
@@ -588,22 +628,26 @@ function render() {
       ctx.restore();
     }
 
-    const dispW = Math.round(S.renderedW), dispH = Math.round(S.renderedH);
-    const intSX = Math.round(S.stormX), intSY = Math.round(S.stormY);
+    const dispW = (S.renderedW + 0.5) | 0;
+    const dispH = (S.renderedH + 0.5) | 0;
+    const intSX = (S.stormX + 0.5) | 0;
+    const intSY = (S.stormY + 0.5) | 0;
 
     if (UI.numSx.value != intSX) UI.numSx.value = intSX;
     if (UI.numSy.value != intSY) UI.numSy.value = intSY;
     if (UI.numSw.value != dispW) UI.numSw.value = dispW;
     if (UI.numSh.value != dispH) UI.numSh.value = dispH;
 
-    const boxL = Math.round(S.stormX - S.renderedW / 2) + 'px';
-    const boxT = Math.round(S.stormY - S.renderedH / 2) + 'px';
+    const transformStr = `translate(${((S.stormX - S.renderedW / 2) + 0.5) | 0}px, ${((S.stormY - S.renderedH / 2) + 0.5) | 0}px)`;
     const boxW = dispW + 'px';
     const boxH = dispH + 'px';
 
-    if (UI.stormBox.style.display !== 'block') UI.stormBox.style.display = 'block';
-    if (lastBoxL !== boxL) { UI.stormBox.style.left = boxL; lastBoxL = boxL; }
-    if (lastBoxT !== boxT) { UI.stormBox.style.top = boxT; lastBoxT = boxT; }
+    if (UI.stormBox.style.display !== 'block') {
+      UI.stormBox.style.display = 'block';
+      UI.stormBox.style.left = '0px';
+      UI.stormBox.style.top = '0px';
+    }
+    if (lastBoxL !== transformStr) { UI.stormBox.style.transform = transformStr; lastBoxL = transformStr; }
     if (lastBoxW !== boxW) { UI.stormBox.style.width = boxW; lastBoxW = boxW; }
     if (lastBoxH !== boxH) { UI.stormBox.style.height = boxH; lastBoxH = boxH; }
   }
@@ -718,29 +762,40 @@ function wire(id, key, transform, valId, format) {
   const el = document.getElementById(id);
   const vl = valId ? document.getElementById(valId) : null;
   el.addEventListener('input', () => {
-    const raw = parseFloat(el.value);
-    S[key] = transform ? transform(raw) : raw;
-    if (vl) vl.textContent = format ? format(S[key]) : S[key];
-    updateSliderFill(el); S.dirty = true;
+    requestAnimationFrame(() => {
+      const raw = parseFloat(el.value);
+      S[key] = transform ? transform(raw) : raw;
+      if (vl) vl.textContent = format ? format(S[key]) : S[key];
+      updateSliderFill(el);
+    });
   });
   updateSliderFill(el);
 }
 
-let procTimer = null;
+function debounce(func, wait) {
+  let timeout;
+  return function(...args) {
+    clearTimeout(timeout);
+    timeout = setTimeout(() => func(...args), wait);
+  };
+}
+
+const debouncedProcessStorm = debounce(processStorm, 50);
 
 function wireProc(id, key, transform, valId, format) {
   const el = document.getElementById(id);
   const vl = valId ? document.getElementById(valId) : null;
   el.addEventListener('input', () => {
-    const raw = parseFloat(el.value);
-    S[key] = transform ? transform(raw) : raw;
-    if (vl) vl.textContent = format ? format(S[key]) : S[key];
-    updateSliderFill(el);
+    requestAnimationFrame(() => {
+      const raw = parseFloat(el.value);
+      S[key] = transform ? transform(raw) : raw;
+      if (vl) vl.textContent = format ? format(S[key]) : S[key];
+      updateSliderFill(el);
 
-    if (S.stormLoaded) {
-      clearTimeout(procTimer);
-      procTimer = setTimeout(processStorm, 50);
-    }
+      if (S.stormLoaded) {
+        debouncedProcessStorm();
+      }
+    });
   });
   updateSliderFill(el);
 }
@@ -809,119 +864,161 @@ document.querySelectorAll('[data-blend]').forEach(btn => {
 /* ──────────────────────────────────────────────────────────────
    EXPORT
 ────────────────────────────────────────────────────────────── */
-function getExportCanvas() {
+async function getExportBlob(mime, quality) {
   const ratio = document.getElementById('sel-ratio').value;
+  let targetW, targetH;
 
   if (ratio === 'full') {
-    return { canvas, width: W, height: H };
-  }
-
-  // base export size on original storm image dimensions
-  let baseSize;
-  if (S.stormLoaded) {
-    // use the processed storm dimensions as the quality reference
-    baseSize = Math.max(offscreen.width, offscreen.height);
+    targetW = W; targetH = H;
   } else {
-    baseSize = Math.min(W, H);
+    let baseSize = S.stormLoaded ? Math.max(offscreen.width, offscreen.height) : Math.min(W, H);
+    if (ratio === 'square') {
+      targetW = targetH = Math.max(512, baseSize);
+    } else if (ratio === '16-9') {
+      targetW = Math.max(1024, baseSize);
+      targetH = Math.round(targetW * 9 / 16);
+    }
   }
 
-  let exportW, exportH;
-  if (ratio === 'square') {
-    exportW = exportH = Math.max(512, baseSize);
-  } else if (ratio === '16-9') {
-    exportW = Math.max(1024, baseSize);
-    exportH = Math.round(exportW * 9 / 16);
-  }
-
-  const exportCanvas = document.createElement('canvas');
-  exportCanvas.width = exportW;
-  exportCanvas.height = exportH;
-  const exportCtx = exportCanvas.getContext('2d');
-
-  // render at high resolution
-  renderCompositeToCanvas(exportCtx, exportW, exportH);
-
-  return { canvas: exportCanvas, width: exportW, height: exportH };
-}
-
-function renderCompositeToCanvas(ctx, targetW, targetH) {
-  // clear background
-  ctx.fillStyle = getComputedStyle(document.body).getPropertyValue('--bg2');
-  ctx.fillRect(0, 0, targetW, targetH);
-
-  // calculate scale and center
   const scale = targetW / W;
   const offsetX = (targetW - W * scale) / 2;
   const offsetY = (targetH - H * scale) / 2;
   const scaledCenterX = offsetX + (S.stormX !== undefined ? S.stormX : W / 2) * scale;
   const scaledCenterY = offsetY + (S.stormY !== undefined ? S.stormY : H / 2) * scale;
 
-  // render map at full resolution
-  if (S.mapLoaded && (mapImg.src || fallbackCanvas)) {
-    const mapSource = fallbackCanvas || mapImg;
-    const mapW = mapBaseW || (fallbackCanvas ? fallbackCanvas.width : mapImg.naturalWidth);
-    const mapH = mapBaseH || (fallbackCanvas ? fallbackCanvas.height : mapImg.naturalHeight);
-    const scaledMapW = mapW * S.mapZoom * scale;
-    const scaledMapH = mapH * S.mapZoom * scale;
+  if (processingWorker && typeof OffscreenCanvas !== 'undefined') {
+    const mapSource = fallbackCanvas || mapBitmap || mapImg;
+    let exportMapBitmap = null, exportStormBitmap = null;
+    
+    if (S.mapLoaded && mapSource) {
+      exportMapBitmap = await createImageBitmap(mapSource);
+    }
+    if (S.stormLoaded && processedStorm) {
+      exportStormBitmap = await createImageBitmap(processedStorm);
+    }
 
-    const mapOffsetX = offsetX + S.mapOffX * scale;
-    const mapOffsetY = offsetY + S.mapOffY * scale;
+    const payload = {
+      type: 'export',
+      targetW, targetH, bg2: getComputedStyle(document.body).getPropertyValue('--bg2'),
+      scale, offsetX, offsetY, scaledCenterX, scaledCenterY,
+      mapBitmap: exportMapBitmap,
+      mapW: mapBaseW || targetW, 
+      mapH: mapBaseH || targetH,
+      scaledMapW: (mapBaseW || targetW) * S.mapZoom * scale,
+      scaledMapH: (mapBaseH || targetH) * S.mapZoom * scale,
+      mapZoom: S.mapZoom, mapOffX: S.mapOffX, mapOffY: S.mapOffY,
+      stormBitmap: exportStormBitmap,
+      renderedW: S.renderedW, renderedH: S.renderedH,
+      opacity: S.opacity, blendMode: S.blendMode,
+      stormRotation: S.stormRotation, flipH: S.flipH, flipV: S.flipV,
+      mime, quality
+    };
 
-    // draw map tiled if needed
-    let drawX = mapOffsetX % scaledMapW;
-    if (drawX > 0) drawX -= scaledMapW;
+    const transfers = [];
+    if (exportMapBitmap) transfers.push(exportMapBitmap);
+    if (exportStormBitmap) transfers.push(exportStormBitmap);
 
-    for (; drawX < targetW; drawX += scaledMapW) {
-      const destX = Math.max(0, drawX);
-      const destRight = Math.min(targetW, drawX + scaledMapW);
-      const destW = destRight - destX;
+    return new Promise(resolve => {
+      activeExportResolve = resolve;
+      processingWorker.postMessage(payload, transfers);
+    });
+  } else {
+    // fallback for browsers without OffscreenCanvas
+    const exportCanvas = document.createElement('canvas');
+    exportCanvas.width = targetW;
+    exportCanvas.height = targetH;
+    const ctx = exportCanvas.getContext('2d');
 
-      if (destW > 0) {
-        const srcX = (destX - drawX) / (S.mapZoom * scale);
-        const srcW = destW / (S.mapZoom * scale);
-        ctx.drawImage(mapSource, srcX, 0, srcW, mapH, destX, mapOffsetY, destW, scaledMapH);
+    ctx.fillStyle = getComputedStyle(document.body).getPropertyValue('--bg2');
+    ctx.fillRect(0, 0, targetW, targetH);
+
+    if (S.mapLoaded) {
+      const mapSource = fallbackCanvas || mapImg;
+      const mapW = mapBaseW || (fallbackCanvas ? fallbackCanvas.width : mapImg.naturalWidth);
+      const mapH = mapBaseH || (fallbackCanvas ? fallbackCanvas.height : mapImg.naturalHeight);
+      const scaledMapW = mapW * S.mapZoom * scale;
+      const scaledMapH = mapH * S.mapZoom * scale;
+      const mapOffsetX = offsetX + S.mapOffX * scale;
+      const mapOffsetY = offsetY + S.mapOffY * scale;
+
+      let drawX = mapOffsetX % scaledMapW;
+      if (drawX > 0) drawX -= scaledMapW;
+
+      for (; drawX < targetW; drawX += scaledMapW) {
+        const destX = Math.max(0, drawX);
+        const destRight = Math.min(targetW, drawX + scaledMapW);
+        const destW = destRight - destX;
+        if (destW > 0) {
+          const srcX = (destX - drawX) / (S.mapZoom * scale);
+          const srcW = destW / (S.mapZoom * scale);
+          ctx.drawImage(mapSource, srcX, 0, srcW, mapH, destX, mapOffsetY, destW, scaledMapH);
+        }
       }
     }
-  }
 
-  // render storm overlay at full resolution
-  if (S.stormLoaded && processedStorm) {
-    const scaledRenderedW = S.renderedW * scale;
-    const scaledRenderedH = S.renderedH * scale;
+    if (S.stormLoaded && processedStorm) {
+      const scaledRenderedW = S.renderedW * scale;
+      const scaledRenderedH = S.renderedH * scale;
+      ctx.save();
+      ctx.globalAlpha = S.opacity;
+      ctx.globalCompositeOperation = S.blendMode;
+      ctx.translate(scaledCenterX, scaledCenterY);
+      ctx.rotate(S.stormRotation * Math.PI / 180);
+      ctx.scale(S.flipH ? -1 : 1, S.flipV ? -1 : 1);
+      ctx.drawImage(processedStorm, -scaledRenderedW / 2, -scaledRenderedH / 2, scaledRenderedW, scaledRenderedH);
+      ctx.restore();
+    }
 
-    ctx.save();
-    ctx.globalAlpha = S.opacity;
-    ctx.globalCompositeOperation = S.blendMode;
-    ctx.translate(scaledCenterX, scaledCenterY);
-    ctx.rotate(S.stormRotation * Math.PI / 180);
-    ctx.scale(S.flipH ? -1 : 1, S.flipV ? -1 : 1);
-    ctx.drawImage(processedStorm, -scaledRenderedW / 2, -scaledRenderedH / 2, scaledRenderedW, scaledRenderedH);
-    ctx.restore();
+    return new Promise(resolve => exportCanvas.toBlob(resolve, mime, quality));
   }
 }
 
-function doExport() {
+async function doExport() {
+  const btn = document.getElementById('btn-export');
+  const ogText = btn.textContent;
+  btn.textContent = "Processing...";
+  btn.disabled = true;
+
   const fmt = document.getElementById('sel-format').value;
   const mime = fmt === 'jpeg' ? 'image/jpeg' : fmt === 'webp' ? 'image/webp' : 'image/png';
   const quality = fmt === 'png' ? 1 : 0.92;
-  const exp = getExportCanvas();
-  const dataURL = exp.canvas.toDataURL(mime, quality);
-  const a = document.createElement('a'); a.href = dataURL; a.download = `storm-composite.${fmt}`; a.click();
+  
+  const blob = await getExportBlob(mime, quality);
+  const dataURL = URL.createObjectURL(blob);
+  
+  const a = document.createElement('a'); 
+  a.href = dataURL; 
+  a.download = `storm-composite.${fmt}`; 
+  a.click();
+  
+  setTimeout(() => URL.revokeObjectURL(dataURL), 5000);
+  
+  btn.textContent = ogText;
+  btn.disabled = false;
 }
 
 document.getElementById('btn-export').addEventListener('click', doExport);
 document.getElementById('btn-export-download').addEventListener('click', doExport);
 
 document.getElementById('btn-copy-canvas').addEventListener('click', async () => {
+  const btn = document.getElementById('btn-copy-canvas');
+  const orig = btn.textContent; 
+  btn.textContent = "Copying...";
+  btn.disabled = true;
+  
   try {
-    const exp = getExportCanvas();
-    exp.canvas.toBlob(async blob => {
-      await navigator.clipboard.write([new ClipboardItem({ 'image/png': blob })]);
-      const btn = document.getElementById('btn-copy-canvas');
-      const orig = btn.textContent; btn.textContent = '✓ Copied!';
-      setTimeout(() => btn.textContent = orig, 1500);
-    });
-  } catch (e) { alert('Clipboard copy requires HTTPS.'); }
+    const blob = await getExportBlob('image/png', 1);
+    await navigator.clipboard.write([new ClipboardItem({ 'image/png': blob })]);
+    btn.textContent = '✓ Copied!';
+  } catch (e) {
+    btn.textContent = 'Failed';
+    console.warn(e);
+  }
+  
+  setTimeout(() => {
+    btn.textContent = orig;
+    btn.disabled = false;
+  }, 1500);
 });
 
 /* ──────────────────────────────────────────────────────────────
