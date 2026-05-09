@@ -133,7 +133,7 @@ let W = 0, H = 0;
 let canvasRect = null;
 
 const offscreen = document.createElement('canvas');
-const offCtx = offscreen.getContext('2d');
+const offCtx = offscreen.getContext('2d', { willReadFrequently: true });
 let processedStorm = null;
 
 const mapImg = new Image();

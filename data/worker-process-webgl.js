@@ -4,13 +4,13 @@ const FRAGMENT_SHADER = `#version 100
 precision highp float;
 
 uniform sampler2D uTexture;
-uniform bool uUseLevels;
+uniform float uUseLevels;
 uniform float uLevelsMin;
 uniform float uLevelsGamma;
 uniform float uLevelsMax;
-uniform bool uDesaturate;
-uniform bool uDoC2A;
-uniform bool uDoCErase;
+uniform float uDesaturate;
+uniform float uDoC2A;
+uniform float uDoCErase;
 uniform float uAlphaThresh;
 uniform float uAlphaFeather;
 
@@ -30,22 +30,22 @@ void main() {
   float alpha = color.a;
 
   // apply levels
-  if (uUseLevels) {
+  if (uUseLevels > 0.5) {
     rgb.r = applyLevels(rgb.r);
     rgb.g = applyLevels(rgb.g);
     rgb.b = applyLevels(rgb.b);
   }
 
   // apply desaturation
-  if (uDesaturate) {
-    float lum = dot(rgb, vec3(0.2118, 0.7154, 0.0745)); // rec709
+  if (uDesaturate > 0.5) {
+    float lum = dot(rgb, vec3(0.2118, 0.7154, 0.0745));
     rgb = vec3(lum);
   }
 
   // apply color-to-alpha or color erase
   float brightness = max(rgb.r, max(rgb.g, rgb.b));
 
-  if (uDoCErase) {
+  if (uDoCErase > 0.5) {
     float alphaFactor = brightness;
     alpha *= alphaFactor;
     if (alphaFactor > 0.0) {
@@ -53,7 +53,7 @@ void main() {
     } else {
       rgb = vec3(0.0);
     }
-  } else if (uDoC2A) {
+  } else if (uDoC2A > 0.5) {
     if (brightness <= uAlphaThresh / 255.0) {
       alpha = 0.0;
     } else if (brightness < (uAlphaThresh + uAlphaFeather) / 255.0) {
@@ -120,7 +120,7 @@ function processPixelsWebGL(imageData, config) {
     const gl = canvas.getContext('webgl', { preserveDrawingBuffer: true, alpha: true });
 
     if (!gl) {
-      console.warn('WebGL unavailable, falling back to CPU');
+      console.warn('[worker] WebGL context unavailable, falling back to CPU processing');
       return null;
     }
 
@@ -150,7 +150,7 @@ function processPixelsWebGL(imageData, config) {
     gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, rendertarget, 0);
 
     if (gl.checkFramebufferStatus(gl.FRAMEBUFFER) !== gl.FRAMEBUFFER_COMPLETE) {
-      console.warn('Framebuffer incomplete, falling back to CPU');
+      console.warn('[worker] Framebuffer incomplete, falling back to CPU');
       return null;
     }
 
@@ -169,17 +169,21 @@ function processPixelsWebGL(imageData, config) {
 
     // set uniforms
     const useLevels = config.levelsMin !== 0 || config.levelsMax !== 255 || config.levelsGamma !== 1.0;
-    gl.uniform1i(gl.getUniformLocation(program, 'uUseLevels'), useLevels);
+    gl.uniform1f(gl.getUniformLocation(program, 'uUseLevels'), useLevels ? 1.0 : 0.0);
     gl.uniform1f(gl.getUniformLocation(program, 'uLevelsMin'), config.levelsMin / 255.0);
     gl.uniform1f(gl.getUniformLocation(program, 'uLevelsGamma'), config.levelsGamma);
     gl.uniform1f(gl.getUniformLocation(program, 'uLevelsMax'), config.levelsMax / 255.0);
-    gl.uniform1i(gl.getUniformLocation(program, 'uDesaturate'), config.desaturate ? 1 : 0);
-    gl.uniform1i(gl.getUniformLocation(program, 'uDoC2A'), config.c2a ? 1 : 0);
-    gl.uniform1i(gl.getUniformLocation(program, 'uDoCErase'), config.cErase ? 1 : 0);
+    gl.uniform1f(gl.getUniformLocation(program, 'uDesaturate'), config.desaturate ? 1.0 : 0.0);
+    gl.uniform1f(gl.getUniformLocation(program, 'uDoC2A'), config.c2a ? 1.0 : 0.0);
+    gl.uniform1f(gl.getUniformLocation(program, 'uDoCErase'), config.cErase ? 1.0 : 0.0);
     gl.uniform1f(gl.getUniformLocation(program, 'uAlphaThresh'), config.alphaThresh);
     gl.uniform1f(gl.getUniformLocation(program, 'uAlphaFeather'), config.alphaFeather);
 
     gl.uniform1i(gl.getUniformLocation(program, 'uTexture'), 0);
+
+    // ensure texture is properly bound to unit 0
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, texture);
 
     // render
     gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
@@ -187,6 +191,12 @@ function processPixelsWebGL(imageData, config) {
     // read pixels
     const output = new Uint8ClampedArray(imageData.width * imageData.height * 4);
     gl.readPixels(0, 0, imageData.width, imageData.height, gl.RGBA, gl.UNSIGNED_BYTE, output);
+
+    // verify we got valid data
+    if (!output || output.length === 0) {
+      console.warn('[worker] readPixels returned empty data, falling back to CPU');
+      return null;
+    }
 
     // cleanup
     gl.deleteTexture(texture);
@@ -197,7 +207,7 @@ function processPixelsWebGL(imageData, config) {
 
     return new ImageData(output, imageData.width, imageData.height);
   } catch (err) {
-    console.warn('WebGL processing failed, falling back to CPU:', err);
+    console.warn('[worker] WebGL processing failed, falling back to CPU:', err.message);
     return null;
   }
 }
