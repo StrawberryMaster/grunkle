@@ -30,7 +30,7 @@ let activeExportResolve = null;
 
 // initialize web worker for offloading pixel processing
 try {
-  processingWorker = new Worker('./data/worker-process.js');
+  processingWorker = new Worker('./data/worker-process-webgl.js');
   processingWorker.onmessage = (event) => {
     if (event.data.type === 'export_done') {
       if (activeExportResolve) activeExportResolve(event.data.blob);
