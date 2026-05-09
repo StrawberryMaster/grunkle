@@ -294,33 +294,6 @@ function zoomMapAt(screenX, screenY, zoomFactor) {
   updateZoomLabel();
 }
 
-mapImg.onload = () => {
-  S.mapLoaded = true;
-  setMapStatus('loaded', `Loaded base · ${mapImg.naturalWidth}×${mapImg.naturalHeight}`);
-  mapBaseW = mapImg.naturalWidth;
-  mapBaseH = mapImg.naturalHeight;
-  fitMap();
-  S.dirty = true;
-  document.getElementById('empty-hint').style.display = 'none';
-
-  if (typeof createImageBitmap === 'function') {
-    createImageBitmap(mapImg).then((bitmap) => {
-      if (mapBitmap && typeof mapBitmap.close === 'function') mapBitmap.close();
-      mapBitmap = bitmap;
-      buildMapMipLevelsAsync(mapBitmap, mapBaseW, mapBaseH);
-      S.dirty = true;
-    }).catch(() => {
-      buildMapMipLevelsAsync(mapImg, mapBaseW, mapBaseH);
-    });
-  } else {
-    buildMapMipLevelsAsync(mapImg, mapBaseW, mapBaseH);
-  }
-};
-mapImg.onerror = () => {
-  setMapStatus('error', 'CORS blocked — using procedural fallback map');
-  drawFallbackMap();
-};
-
 function fitMap() {
   const baseW = mapBaseW || mapImg.naturalWidth;
   const baseH = mapBaseH || mapImg.naturalHeight;
@@ -337,8 +310,87 @@ function fitMap() {
   updateZoomLabel();
 }
 
-setMapStatus('loading', 'Loading map…');
-mapImg.src = MAP_URL;
+async function loadMapPipeline() {
+  setMapStatus('loading', 'Downloading map data…');
+  try {
+    const response = await fetch(MAP_URL);
+    if (!response.ok) throw new Error('Network response was not ok');
+
+    const contentLength = response.headers.get('content-length');
+    let blob;
+
+    if (!contentLength || !response.body) {
+      blob = await response.blob();
+    } else {
+      const total = parseInt(contentLength, 10);
+      let loaded = 0;
+      const reader = response.body.getReader();
+      const chunks = [];
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        chunks.push(value);
+        loaded += value.length;
+        const pct = Math.round((loaded / total) * 100);
+        setMapStatus('loading', `Downloading map… ${pct}%`);
+        
+        ctx.fillStyle = getComputedStyle(document.body).getPropertyValue('--bg2');
+        ctx.fillRect(0, 0, W, H);
+        ctx.fillStyle = getComputedStyle(document.body).getPropertyValue('--text-muted');
+        ctx.font = '16px "Inter", sans-serif';
+        ctx.textAlign = 'center';
+        ctx.fillText(`Downloading map… ${pct}%`, W/2, H/2);
+      }
+      blob = new Blob(chunks, { type: response.headers.get('content-type') || 'image/jpeg' });
+    }
+
+    setMapStatus('loading', 'Decoding off-thread…');
+    ctx.fillStyle = getComputedStyle(document.body).getPropertyValue('--bg2');
+    ctx.fillRect(0, 0, W, H);
+    ctx.fillStyle = getComputedStyle(document.body).getPropertyValue('--text-muted');
+    ctx.textAlign = 'center';
+    ctx.fillText(`Decoding map image (might take a few seconds)…`, W/2, H/2);
+
+    if (typeof createImageBitmap === 'function') {
+      const bitmap = await createImageBitmap(blob);
+      if (mapBitmap) mapBitmap.close();
+      mapBitmap = bitmap;
+      mapBaseW = bitmap.width;
+      mapBaseH = bitmap.height;
+      S.mapLoaded = true;
+      setMapStatus('loaded', `Loaded base · ${mapBaseW}×${mapBaseH}`);
+      fitMap();
+      S.dirty = true;
+      document.getElementById('empty-hint').style.display = 'none';
+      buildMapMipLevelsAsync(mapBitmap, mapBaseW, mapBaseH);
+    } else {
+      // Fallback for older browsers
+      mapImg.src = URL.createObjectURL(blob);
+    }
+  } catch (err) {
+    console.error(err);
+    setMapStatus('error', 'CORS blocked — using procedural fallback map');
+    drawFallbackMap();
+  }
+}
+
+mapImg.onload = () => {
+  S.mapLoaded = true;
+  setMapStatus('loaded', `Loaded base · ${mapImg.naturalWidth}×${mapImg.naturalHeight}`);
+  mapBaseW = mapImg.naturalWidth;
+  mapBaseH = mapImg.naturalHeight;
+  fitMap();
+  S.dirty = true;
+  document.getElementById('empty-hint').style.display = 'none';
+  buildMapMipLevelsAsync(mapImg, mapBaseW, mapBaseH);
+};
+mapImg.onerror = () => {
+  setMapStatus('error', 'Failed to load fallback image');
+  drawFallbackMap();
+};
+
+loadMapPipeline();
 
 let lastZoomText = '';
 const valMapZoom = document.getElementById('val-mapzoom');
