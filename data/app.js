@@ -1,15 +1,29 @@
 /* ──────────────────────────────────────────────────────────────
-   THEME TOGGLE
+   THEME TOGGLE & CACHED STYLES
 ────────────────────────────────────────────────────────────── */
 const btnTheme = document.getElementById('btn-theme');
+let cachedBgColor = '#121212';
+let cachedMutedColor = '#888888';
+
+function updateThemeCache() {
+  const computed = getComputedStyle(document.body);
+  cachedBgColor = computed.getPropertyValue('--bg2').trim() || '#121212';
+  cachedMutedColor = computed.getPropertyValue('--text-muted').trim() || '#888888';
+  try { S.dirty = true; } catch (_) {}
+}
+
 btnTheme.addEventListener('click', () => {
   const root = document.documentElement;
   const isDark = root.getAttribute('data-theme') === 'dark';
   root.setAttribute('data-theme', isDark ? 'light' : 'dark');
   btnTheme.textContent = isDark ? '🌙' : '☀️';
+  updateThemeCache();
 });
 
-// service worker registration for offline caching
+// cache styles initially on load
+updateThemeCache();
+
+// service worker registration
 if ('serviceWorker' in navigator) {
   window.addEventListener('load', () => {
     navigator.serviceWorker.register('./service-worker.js')
@@ -25,10 +39,9 @@ let fallbackCanvas = null;
 let processingWorker = null;
 let isProcessing = false;
 let procStartTime = 0;
-
 let activeExportResolve = null;
 
-// initialize web worker for offloading pixel processing
+// initialize Web Worker
 try {
   processingWorker = new Worker('./data/worker-process-webgl.js');
   processingWorker.onmessage = (event) => {
@@ -42,13 +55,14 @@ try {
     S.perfProc = performance.now() - procStartTime;
     updatePerfUI();
     S.dirty = true;
+    
     document.getElementById('btn-export').disabled = false;
     document.getElementById('btn-export-download').disabled = false;
     document.getElementById('btn-copy-canvas').disabled = false;
     isProcessing = false;
   };
 } catch (e) {
-  console.warn('Web Worker not available, using main thread:', e);
+  console.warn('Web Worker not available, fallback to optimized main thread:', e);
 }
 
 const rawState = {
@@ -85,9 +99,9 @@ const UI = {
   hudMode: document.getElementById('hud-mode')
 };
 
-// state trackers to throttle DOM writes
+// throttle DOM state updates
 let lastLat = null, lastLon = null, lastMode = null;
-let lastBoxL = null, lastBoxT = null, lastBoxW = null, lastBoxH = null;
+let lastBoxL = null, lastBoxW = null, lastBoxH = null;
 
 const appLayout = document.getElementById('app');
 const btnToggleLeft = document.getElementById('btn-toggle-left');
@@ -99,36 +113,28 @@ function resizeAfterTransition() {
   S.dirty = true;
 }
 
-btnToggleLeft.addEventListener('click', () => {
-  appLayout.classList.toggle('hide-left');
-  btnToggleLeft.textContent = appLayout.classList.contains('hide-left') ? '▶' : '◀';
-  // listen for end of CSS animation, then resize
-  const handler = () => {
-    resizeAfterTransition();
-    appLayout.removeEventListener('transitionend', handler);
-  };
-  appLayout.addEventListener('transitionend', handler);
-  // fallback timeout in case transitionend doesn't fire
-  setTimeout(() => appLayout.removeEventListener('transitionend', handler), 350);
-});
+const setupPanelToggle = (btn, toggleClass, arrowOpen, arrowClosed) => {
+  btn.addEventListener('click', () => {
+    appLayout.classList.toggle(toggleClass);
+    btn.textContent = appLayout.classList.contains(toggleClass) ? arrowClosed : arrowOpen;
+    const handler = () => {
+      resizeAfterTransition();
+      appLayout.removeEventListener('transitionend', handler);
+    };
+    appLayout.addEventListener('transitionend', handler);
+    setTimeout(() => appLayout.removeEventListener('transitionend', handler), 350);
+  });
+};
 
-btnToggleRight.addEventListener('click', () => {
-  appLayout.classList.toggle('hide-right');
-  btnToggleRight.textContent = appLayout.classList.contains('hide-right') ? '◀' : '▶';
-  const handler = () => {
-    resizeAfterTransition();
-    appLayout.removeEventListener('transitionend', handler);
-  };
-  appLayout.addEventListener('transitionend', handler);
-  setTimeout(() => appLayout.removeEventListener('transitionend', handler), 350);
-});
+setupPanelToggle(btnToggleLeft, 'hide-left', '◀', '▶');
+setupPanelToggle(btnToggleRight, 'hide-right', '▶', '◀');
 
 /* ──────────────────────────────────────────────────────────────
    CANVAS SETUP
 ────────────────────────────────────────────────────────────── */
 const canvasArea = document.getElementById('canvas-area');
 const canvas = document.getElementById('main-canvas');
-const ctx = canvas.getContext('2d', { alpha: false });
+const ctx = canvas.getContext('2d', { alpha: false, desynchronized: true });
 let W = 0, H = 0;
 let canvasRect = null;
 
@@ -160,17 +166,16 @@ new ResizeObserver(resize).observe(canvasArea);
 resize();
 
 /* ──────────────────────────────────────────────────────────────
-   MAP LOADING
+   MAP LOADING & MIPMAP GENERATION
 ────────────────────────────────────────────────────────────── */
 const MAP_URL = './files/bg21600-nxtgen.jpg';
-
 const mapStatus = document.getElementById('map-status');
 const badgeMap = document.getElementById('badge-map');
 
 function setMapStatus(state, msg) {
   mapStatus.className = state;
   mapStatus.textContent = msg;
-  badgeMap.innerHTML = `<span class="accent-letter">M</span> MAP: ` + (state === 'loaded' ? 'OK' : state.toUpperCase());
+  badgeMap.innerHTML = `<span class="accent-letter">M</span> MAP: ${state === 'loaded' ? 'OK' : state.toUpperCase()}`;
   badgeMap.className = 'badge' + (state === 'loaded' ? ' active' : '');
 }
 
@@ -195,20 +200,14 @@ function buildMapMipLevelsAsync(baseSource, baseW, baseH) {
   let prevW = baseW;
   let prevH = baseH;
 
-  const schedule = (fn) => {
-    if (typeof requestIdleCallback === 'function') {
-      requestIdleCallback(fn, { timeout: 60 });
-    } else {
-      setTimeout(() => fn(null), 0);
-    }
-  };
+  const schedule = (fn) => typeof requestIdleCallback === 'function' ? requestIdleCallback(fn, { timeout: 60 }) : setTimeout(() => fn(null), 0);
 
   const step = async () => {
     if (token !== mapMipBuildToken) return;
 
     if (Math.min(prevW, prevH) > MIN_DIM) {
-      const nextW = Math.max(MIN_DIM, Math.floor(prevW / 2));
-      const nextH = Math.max(MIN_DIM, Math.floor(prevH / 2));
+      const nextW = Math.max(MIN_DIM, (prevW >> 1));
+      const nextH = Math.max(MIN_DIM, (prevH >> 1));
       if (nextW === prevW && nextH === prevH) return;
 
       try {
@@ -300,20 +299,21 @@ function fitMap() {
   if (!baseW || !baseH) return;
 
   const aspect = baseW / baseH;
-  if (W / H > aspect) {
-    S.mapZoom = H / baseH;
-  } else {
-    S.mapZoom = W / baseW;
-  }
+  S.mapZoom = (W / H > aspect) ? (H / baseH) : (W / baseW);
   S.mapOffX = (W - baseW * S.mapZoom) / 2;
   S.mapOffY = (H - baseH * S.mapZoom) / 2;
   updateZoomLabel();
 }
 
+let mapAbortController = null;
+
 async function loadMapPipeline() {
   setMapStatus('loading', 'Downloading map data…');
+  if (mapAbortController) mapAbortController.abort();
+  mapAbortController = new AbortController();
+
   try {
-    const response = await fetch(MAP_URL);
+    const response = await fetch(MAP_URL, { signal: mapAbortController.signal });
     if (!response.ok) throw new Error('Network response was not ok');
 
     const contentLength = response.headers.get('content-length');
@@ -333,28 +333,28 @@ async function loadMapPipeline() {
         chunks.push(value);
         loaded += value.length;
         const pct = Math.round((loaded / total) * 100);
-        setMapStatus('loading', `Downloading map… ${pct}%`);
         
-        ctx.fillStyle = getComputedStyle(document.body).getPropertyValue('--bg2');
+        setMapStatus('loading', `Downloading map… ${pct}%`);
+        ctx.fillStyle = cachedBgColor;
         ctx.fillRect(0, 0, W, H);
-        ctx.fillStyle = getComputedStyle(document.body).getPropertyValue('--text-muted');
+        ctx.fillStyle = cachedMutedColor;
         ctx.font = '16px "Inter", sans-serif';
         ctx.textAlign = 'center';
-        ctx.fillText(`Downloading map… ${pct}%`, W/2, H/2);
+        ctx.fillText(`Downloading map… ${pct}%`, W / 2, H / 2);
       }
       blob = new Blob(chunks, { type: response.headers.get('content-type') || 'image/jpeg' });
     }
 
     setMapStatus('loading', 'Decoding off-thread…');
-    ctx.fillStyle = getComputedStyle(document.body).getPropertyValue('--bg2');
+    ctx.fillStyle = cachedBgColor;
     ctx.fillRect(0, 0, W, H);
-    ctx.fillStyle = getComputedStyle(document.body).getPropertyValue('--text-muted');
+    ctx.fillStyle = cachedMutedColor;
     ctx.textAlign = 'center';
-    ctx.fillText(`Decoding map image (might take a few seconds)…`, W/2, H/2);
+    ctx.fillText(`Decoding map image (might take a few seconds)…`, W / 2, H / 2);
 
     if (typeof createImageBitmap === 'function') {
       const bitmap = await createImageBitmap(blob);
-      if (mapBitmap) mapBitmap.close();
+      if (mapBitmap && typeof mapBitmap.close === 'function') mapBitmap.close();
       mapBitmap = bitmap;
       mapBaseW = bitmap.width;
       mapBaseH = bitmap.height;
@@ -365,10 +365,10 @@ async function loadMapPipeline() {
       document.getElementById('empty-hint').style.display = 'none';
       buildMapMipLevelsAsync(mapBitmap, mapBaseW, mapBaseH);
     } else {
-      // Fallback for older browsers
       mapImg.src = URL.createObjectURL(blob);
     }
   } catch (err) {
+    if (err.name === 'AbortError') return;
     console.error(err);
     setMapStatus('error', 'CORS blocked — using procedural fallback map');
     drawFallbackMap();
@@ -444,12 +444,14 @@ function handleFile(file) {
 
     const info = document.getElementById('storm-info');
     info.style.display = 'block';
-    info.innerHTML = `<strong>${file.name}</strong><br>${stormImg.naturalWidth}×${stormImg.naturalHeight} · ${(file.size / 1024 / 1024).toFixed(1)} MB`;
+    info.innerHTML = `<strong>${file.name}</strong><br>${stormImg.naturalWidth}×${stormImg.naturalHeight} · ${(file.size / 1048576).toFixed(1)} MB`;
 
     const badgeStorm = document.getElementById('badge-storm');
     badgeStorm.innerHTML = `<span class="accent-letter">S</span> STORM: ${stormImg.naturalWidth}×${stormImg.naturalHeight}`;
     badgeStorm.className = 'badge active';
-    document.getElementById('perf-val-px').textContent = (stormImg.naturalWidth * stormImg.naturalHeight / 1e6).toFixed(2) + ' MP';['sl-scale', 'sl-rotate', 'sl-opacity', 'btn-flip-h', 'btn-flip-v', 'btn-reset-tr', 'btn-center', 'btn-apply'].forEach(id => {
+    document.getElementById('perf-val-px').textContent = ((stormImg.naturalWidth * stormImg.naturalHeight) / 1e6).toFixed(2) + ' MP';
+    
+    ['sl-scale', 'sl-rotate', 'sl-opacity', 'btn-flip-h', 'btn-flip-v', 'btn-reset-tr', 'btn-center', 'btn-apply'].forEach(id => {
       const el = document.getElementById(id);
       if (el) el.disabled = false;
     });
@@ -471,7 +473,7 @@ function processStorm() {
   let sw = stormImg.naturalWidth, sh = stormImg.naturalHeight;
   if (sw > MAX || sh > MAX) {
     const r = Math.min(MAX / sw, MAX / sh);
-    sw = Math.round(sw * r); sh = Math.round(sh * r);
+    sw = (sw * r) | 0; sh = (sh * r) | 0;
   }
 
   if (offscreen.width !== sw || offscreen.height !== sh) {
@@ -517,7 +519,7 @@ function processPixelsMainThread(imgData) {
   const invFeather = 1 / feather;
 
   const useLevels = (lvMin !== 0 || lvMax !== 255 || lvGam !== 1.0);
-  let lut;
+  let lut = null;
   if (useLevels) {
     lut = new Uint8Array(256);
     const invGamma = 1 / lvGam;
@@ -526,60 +528,56 @@ function processPixelsMainThread(imgData) {
       let v = i;
       if (v < lvMin) v = lvMin;
       else if (v > lvMax) v = lvMax;
-      if (range === 0) v = 0;
-      else v = Math.pow((v - lvMin) / range, invGamma) * 255;
-      lut[i] = v;
+      lut[i] = range === 0 ? 0 : Math.pow((v - lvMin) / range, invGamma) * 255;
     }
   }
 
-  if (useLevels) {
-    for (let i = 0; i < n; i += 4) {
-      d[i]   = lut[d[i]];
-      d[i+1] = lut[d[i+1]];
-      d[i+2] = lut[d[i+2]];
-    }
-  }
+  for (let i = 0; i < n; i += 4) {
+    let a = d[i + 3];
+    if (a === 0) continue; // skip transparent pixels immediately
 
-  if (desat) {
-    for (let i = 0; i < n; i += 4) {
-      const lum = (54 * d[i] + 183 * d[i+1] + 19 * d[i+2]) >> 8;
-      d[i] = d[i+1] = d[i+2] = lum;
-    }
-  }
+    let r = d[i], g = d[i + 1], b = d[i + 2];
 
-  if (doCErase) {
-    for (let i = 0; i < n; i += 4) {
-      let r = d[i], g = d[i+1], b = d[i+2];
-      let brightness = r > g ? (r > b ? r : b) : (g > b ? g : b);
-      
+    if (useLevels) {
+      r = lut[r];
+      g = lut[g];
+      b = lut[b];
+    }
+
+    if (desat) {
+      const lum = (54 * r + 183 * g + 19 * b) >> 8;
+      r = g = b = lum;
+    }
+
+    if (doCErase) {
+      const brightness = r > g ? (r > b ? r : b) : (g > b ? g : b);
       const alphaFactor = brightness / 255;
-      d[i+3] = (alphaFactor * d[i+3]) | 0;
+      a = (alphaFactor * a) | 0;
       if (alphaFactor > 0) {
         const norm = 1 / alphaFactor;
-        d[i]   = Math.min(255, r * norm) | 0;
-        d[i+1] = Math.min(255, g * norm) | 0;
-        d[i+2] = Math.min(255, b * norm) | 0;
+        r = Math.min(255, (r * norm) | 0);
+        g = Math.min(255, (g * norm) | 0);
+        b = Math.min(255, (b * norm) | 0);
       } else {
-        d[i] = d[i+1] = d[i+2] = 0;
+        r = g = b = 0;
       }
-    }
-  } else if (doC2A) {
-    for (let i = 0; i < n; i += 4) {
-      let r = d[i], g = d[i+1], b = d[i+2];
-      let brightness = r > g ? (r > b ? r : b) : (g > b ? g : b);
+    } else if (doC2A) {
+      const brightness = r > g ? (r > b ? r : b) : (g > b ? g : b);
       if (brightness <= thresh) {
-        d[i + 3] = 0;
+        a = 0;
       } else if (brightness < thresh + feather) {
-        const alphaFactor = (brightness - thresh) / feather;
-        d[i + 3] = (alphaFactor * 255) | 0;
+        const alphaFactor = (brightness - thresh) * invFeather;
+        a = (alphaFactor * a) | 0;
         if (alphaFactor > 0) {
           const norm = 1 / alphaFactor;
-          d[i]   = Math.min(255, r * norm) | 0;
-          d[i+1] = Math.min(255, g * norm) | 0;
-          d[i+2] = Math.min(255, b * norm) | 0;
+          r = Math.min(255, (r * norm) | 0);
+          g = Math.min(255, (g * norm) | 0);
+          b = Math.min(255, (b * norm) | 0);
         }
       }
     }
+
+    d[i] = r; d[i + 1] = g; d[i + 2] = b; d[i + 3] = a;
   }
 
   offCtx.putImageData(imgData, 0, 0);
@@ -593,7 +591,6 @@ function processPixelsMainThread(imgData) {
   isProcessing = false;
 }
 
-
 /* ──────────────────────────────────────────────────────────────
    RENDER LOOP
 ────────────────────────────────────────────────────────────── */
@@ -603,10 +600,11 @@ function render() {
 
   const t0 = performance.now();
 
-  ctx.imageSmoothingEnabled = imageSmoothing && !lowQualityRender;
+  ctx.imageSmoothingEnabled = imageSmoothing;
+  ctx.imageSmoothingQuality = lowQualityRender ? 'low' : 'high';
 
-  // clear canvas
-  ctx.fillStyle = getComputedStyle(document.body).getPropertyValue('--bg2');
+
+  ctx.fillStyle = cachedBgColor;
   ctx.fillRect(0, 0, W, H);
 
   const mapLevel = S.mapLoaded ? getMapSourceLevel() : null;
@@ -618,12 +616,10 @@ function render() {
     const mw = mapBaseW * S.mapZoom;
     const mh = mapBaseH * S.mapZoom;
 
-    // calculate fractional tile offset
     let startX = S.mapOffX % mw;
-    if (startX > 0) startX -= mw; // ensure we always cover the left screen edge
+    if (startX > 0) startX -= mw;
 
     for (let drawX = startX; drawX < W; drawX += mw) {
-      // calculate screen visibility boundaries
       const destX = Math.max(0, drawX);
       const destY = Math.max(0, S.mapOffY);
       const destRight = Math.min(W, drawX + mw);
@@ -632,10 +628,8 @@ function render() {
       const destW = destRight - destX;
       const destH = destBottom - destY;
 
-      // skip if completely off-screen
       if (destW <= 0 || destH <= 0) continue;
 
-      // map destination pixels back to source pixels
       const srcCropXWorld = (destX - drawX) / S.mapZoom;
       const srcCropYWorld = (destY - S.mapOffY) / S.mapZoom;
       const srcCropWWorld = destW / S.mapZoom;
@@ -646,18 +640,13 @@ function render() {
       const srcCropW = srcCropWWorld * srcFactor;
       const srcCropH = srcCropHWorld * srcFactor;
 
-      // safeguard floats
       const safeSrcX = Math.max(0, Math.min(srcCropX, srcW));
       const safeSrcY = Math.max(0, Math.min(srcCropY, srcH));
       const safeSrcW = Math.min(srcCropW, srcW - safeSrcX);
       const safeSrcH = Math.min(srcCropH, srcH - safeSrcY);
 
       if (safeSrcW > 0 && safeSrcH > 0) {
-        ctx.drawImage(
-          src,
-          safeSrcX, safeSrcY, safeSrcW, safeSrcH, // source cropping
-          destX, destY, destW, destH              // destination canvas rect
-        );
+        ctx.drawImage(src, safeSrcX, safeSrcY, safeSrcW, safeSrcH, destX, destY, destW, destH);
       }
     }
   }
@@ -669,12 +658,11 @@ function render() {
 
     const radius = Math.max(S.renderedW, S.renderedH);
     if (S.stormX + radius > 0 && S.stormX - radius < W && S.stormY + radius > 0 && S.stormY - radius < H) {
-
       ctx.save();
       ctx.globalAlpha = S.opacity;
       ctx.globalCompositeOperation = S.blendMode;
       ctx.translate(S.stormX, S.stormY);
-      ctx.rotate(S.stormRotation * Math.PI / 180);
+      ctx.rotate((S.stormRotation * Math.PI) / 180);
       ctx.scale(S.flipH ? -1 : 1, S.flipV ? -1 : 1);
       ctx.drawImage(processedStorm, -S.renderedW / 2, -S.renderedH / 2, S.renderedW, S.renderedH);
       ctx.restore();
@@ -685,10 +673,10 @@ function render() {
     const intSX = (S.stormX + 0.5) | 0;
     const intSY = (S.stormY + 0.5) | 0;
 
-    if (UI.numSx.value != intSX) UI.numSx.value = intSX;
-    if (UI.numSy.value != intSY) UI.numSy.value = intSY;
-    if (UI.numSw.value != dispW) UI.numSw.value = dispW;
-    if (UI.numSh.value != dispH) UI.numSh.value = dispH;
+    if (document.activeElement !== UI.numSx && UI.numSx.value != intSX) UI.numSx.value = intSX;
+    if (document.activeElement !== UI.numSy && UI.numSy.value != intSY) UI.numSy.value = intSY;
+    if (document.activeElement !== UI.numSw && UI.numSw.value != dispW) UI.numSw.value = dispW;
+    if (document.activeElement !== UI.numSh && UI.numSh.value != dispH) UI.numSh.value = dispH;
 
     const transformStr = `translate(${((S.stormX - S.renderedW / 2) + 0.5) | 0}px, ${((S.stormY - S.renderedH / 2) + 0.5) | 0}px)`;
     const boxW = dispW + 'px';
@@ -708,12 +696,11 @@ function render() {
   updatePerfUI();
 }
 
-
 function loop() { if (S.dirty) render(); requestAnimationFrame(loop); }
 loop();
 
 /* ──────────────────────────────────────────────────────────────
-   MOUSE INTERACTION
+   POINTER INTERACTION
 ────────────────────────────────────────────────────────────── */
 function isOverStorm(mx, my) {
   if (!S.stormLoaded) return false;
@@ -721,8 +708,9 @@ function isOverStorm(mx, my) {
     my >= S.stormY - S.renderedH / 2 && my <= S.stormY + S.renderedH / 2);
 }
 
-canvas.addEventListener('mousedown', e => {
+canvas.addEventListener('pointerdown', e => {
   if (!canvasRect) return;
+  canvas.setPointerCapture(e.pointerId);
   const mx = e.clientX - canvasRect.left;
   const my = e.clientY - canvasRect.top;
   S.dragging = true;
@@ -739,7 +727,7 @@ canvas.addEventListener('mousedown', e => {
   }
 });
 
-canvas.addEventListener('mousemove', e => {
+canvas.addEventListener('pointermove', e => {
   if (!canvasRect) return;
   const mx = e.clientX - canvasRect.left;
   const my = e.clientY - canvasRect.top;
@@ -752,7 +740,6 @@ canvas.addEventListener('mousemove', e => {
     const lon = ((imgX / mw) * 360 - 180).toFixed(2);
     const lat = (90 - (imgY / mh) * 180).toFixed(2);
 
-    // only update DOM text if it shifted
     if (lat !== lastLat || lon !== lastLon) {
       UI.hudCoords.textContent = `LAT ${lat}° · LON ${lon}°`;
       lastLat = lat; lastLon = lon;
@@ -784,8 +771,16 @@ canvas.addEventListener('mousemove', e => {
   }
 });
 
-canvas.addEventListener('mouseup', () => { S.dragging = false; canvas.style.cursor = 'crosshair'; });
-canvas.addEventListener('mouseleave', () => { S.dragging = false; });
+const handlePointerEnd = e => {
+  if (canvas.hasPointerCapture(e.pointerId)) {
+    canvas.releasePointerCapture(e.pointerId);
+  }
+  S.dragging = false; 
+  canvas.style.cursor = 'crosshair';
+};
+
+canvas.addEventListener('pointerup', handlePointerEnd);
+canvas.addEventListener('pointercancel', handlePointerEnd);
 
 canvas.addEventListener('wheel', e => {
   e.preventDefault();
@@ -797,9 +792,10 @@ canvas.addEventListener('wheel', e => {
 
   if (S.stormLoaded && isOverStorm(mx, my)) {
     S.stormScale = Math.max(5, Math.min(200, S.stormScale * delta));
-    document.getElementById('sl-scale').value = S.stormScale;
+    const sl = document.getElementById('sl-scale');
+    sl.value = S.stormScale;
     document.getElementById('val-scale').textContent = Math.round(S.stormScale) + '%';
-    updateSliderFill(document.getElementById('sl-scale'));
+    updateSliderFill(sl);
   } else {
     zoomMapAt(mx, my, delta);
     markMapInteraction();
@@ -914,7 +910,7 @@ document.querySelectorAll('[data-blend]').forEach(btn => {
 });
 
 /* ──────────────────────────────────────────────────────────────
-   EXPORT
+   EXPORT PIPELINE
 ────────────────────────────────────────────────────────────── */
 async function getExportBlob(mime, quality) {
   const ratio = document.getElementById('sel-ratio').value;
@@ -923,12 +919,12 @@ async function getExportBlob(mime, quality) {
   if (ratio === 'full') {
     targetW = W; targetH = H;
   } else {
-    let baseSize = S.stormLoaded ? Math.max(offscreen.width, offscreen.height) : Math.min(W, H);
+    const baseSize = S.stormLoaded ? Math.max(offscreen.width, offscreen.height) : Math.min(W, H);
     if (ratio === 'square') {
       targetW = targetH = Math.max(512, baseSize);
     } else if (ratio === '16-9') {
       targetW = Math.max(1024, baseSize);
-      targetH = Math.round(targetW * 9 / 16);
+      targetH = Math.round((targetW * 9) / 16);
     }
   }
 
@@ -941,7 +937,7 @@ async function getExportBlob(mime, quality) {
   if (processingWorker && typeof OffscreenCanvas !== 'undefined') {
     const mapSource = fallbackCanvas || mapBitmap || mapImg;
     let exportMapBitmap = null, exportStormBitmap = null;
-    
+
     if (S.mapLoaded && mapSource) {
       exportMapBitmap = await createImageBitmap(mapSource);
     }
@@ -951,10 +947,10 @@ async function getExportBlob(mime, quality) {
 
     const payload = {
       type: 'export',
-      targetW, targetH, bg2: getComputedStyle(document.body).getPropertyValue('--bg2'),
+      targetW, targetH, bg2: cachedBgColor,
       scale, offsetX, offsetY, scaledCenterX, scaledCenterY,
       mapBitmap: exportMapBitmap,
-      mapW: mapBaseW || targetW, 
+      mapW: mapBaseW || targetW,
       mapH: mapBaseH || targetH,
       scaledMapW: (mapBaseW || targetW) * S.mapZoom * scale,
       scaledMapH: (mapBaseH || targetH) * S.mapZoom * scale,
@@ -975,14 +971,14 @@ async function getExportBlob(mime, quality) {
       processingWorker.postMessage(payload, transfers);
     });
   } else {
-    // fallback for browsers without OffscreenCanvas
+    // fallback export rendering
     const exportCanvas = document.createElement('canvas');
     exportCanvas.width = targetW;
     exportCanvas.height = targetH;
-    const ctx = exportCanvas.getContext('2d');
+    const eCtx = exportCanvas.getContext('2d');
 
-    ctx.fillStyle = getComputedStyle(document.body).getPropertyValue('--bg2');
-    ctx.fillRect(0, 0, targetW, targetH);
+    eCtx.fillStyle = cachedBgColor;
+    eCtx.fillRect(0, 0, targetW, targetH);
 
     if (S.mapLoaded) {
       const mapSource = fallbackCanvas || mapImg;
@@ -1003,7 +999,7 @@ async function getExportBlob(mime, quality) {
         if (destW > 0) {
           const srcX = (destX - drawX) / (S.mapZoom * scale);
           const srcW = destW / (S.mapZoom * scale);
-          ctx.drawImage(mapSource, srcX, 0, srcW, mapH, destX, mapOffsetY, destW, scaledMapH);
+          eCtx.drawImage(mapSource, srcX, 0, srcW, mapH, destX, mapOffsetY, destW, scaledMapH);
         }
       }
     }
@@ -1011,14 +1007,14 @@ async function getExportBlob(mime, quality) {
     if (S.stormLoaded && processedStorm) {
       const scaledRenderedW = S.renderedW * scale;
       const scaledRenderedH = S.renderedH * scale;
-      ctx.save();
-      ctx.globalAlpha = S.opacity;
-      ctx.globalCompositeOperation = S.blendMode;
-      ctx.translate(scaledCenterX, scaledCenterY);
-      ctx.rotate(S.stormRotation * Math.PI / 180);
-      ctx.scale(S.flipH ? -1 : 1, S.flipV ? -1 : 1);
-      ctx.drawImage(processedStorm, -scaledRenderedW / 2, -scaledRenderedH / 2, scaledRenderedW, scaledRenderedH);
-      ctx.restore();
+      eCtx.save();
+      eCtx.globalAlpha = S.opacity;
+      eCtx.globalCompositeOperation = S.blendMode;
+      eCtx.translate(scaledCenterX, scaledCenterY);
+      eCtx.rotate((S.stormRotation * Math.PI) / 180);
+      eCtx.scale(S.flipH ? -1 : 1, S.flipV ? -1 : 1);
+      eCtx.drawImage(processedStorm, -scaledRenderedW / 2, -scaledRenderedH / 2, scaledRenderedW, scaledRenderedH);
+      eCtx.restore();
     }
 
     return new Promise(resolve => exportCanvas.toBlob(resolve, mime, quality));
@@ -1034,17 +1030,17 @@ async function doExport() {
   const fmt = document.getElementById('sel-format').value;
   const mime = fmt === 'jpeg' ? 'image/jpeg' : fmt === 'webp' ? 'image/webp' : 'image/png';
   const quality = fmt === 'png' ? 1 : 0.92;
-  
+
   const blob = await getExportBlob(mime, quality);
   const dataURL = URL.createObjectURL(blob);
-  
-  const a = document.createElement('a'); 
-  a.href = dataURL; 
-  a.download = `storm-composite.${fmt}`; 
+
+  const a = document.createElement('a');
+  a.href = dataURL;
+  a.download = `storm-composite.${fmt}`;
   a.click();
-  
+
   setTimeout(() => URL.revokeObjectURL(dataURL), 5000);
-  
+
   btn.textContent = ogText;
   btn.disabled = false;
 }
@@ -1054,10 +1050,10 @@ document.getElementById('btn-export-download').addEventListener('click', doExpor
 
 document.getElementById('btn-copy-canvas').addEventListener('click', async () => {
   const btn = document.getElementById('btn-copy-canvas');
-  const orig = btn.textContent; 
+  const orig = btn.textContent;
   btn.textContent = "Copying...";
   btn.disabled = true;
-  
+
   try {
     const blob = await getExportBlob('image/png', 1);
     await navigator.clipboard.write([new ClipboardItem({ 'image/png': blob })]);
@@ -1066,7 +1062,7 @@ document.getElementById('btn-copy-canvas').addEventListener('click', async () =>
     btn.textContent = 'Failed';
     console.warn(e);
   }
-  
+
   setTimeout(() => {
     btn.textContent = orig;
     btn.disabled = false;
@@ -1074,7 +1070,7 @@ document.getElementById('btn-copy-canvas').addEventListener('click', async () =>
 });
 
 /* ──────────────────────────────────────────────────────────────
-   HELPERS
+   HELPERS & PERF MONITORING
 ────────────────────────────────────────────────────────────── */
 function setSlider(id, val, valId, display) {
   const el = document.getElementById(id); el.value = val;
@@ -1084,7 +1080,7 @@ function setSlider(id, val, valId, display) {
 
 function updateSliderFill(el) {
   if (el.type !== 'range') return;
-  const pct = (el.value - el.min) / (el.max - el.min) * 100;
+  const pct = ((el.value - el.min) / (el.max - el.min)) * 100;
   el.style.setProperty('--fill', pct + '%');
 }
 document.querySelectorAll('input[type=range]').forEach(updateSliderFill);

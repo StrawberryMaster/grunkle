@@ -1,48 +1,56 @@
 // WebGL-accelerated pixel processing worker
 
+const VERTEX_SHADER = `#version 100
+precision highp float;
+
+attribute vec2 aPosition;
+varying vec2 vTexCoord;
+
+void main() {
+  gl_Position = vec4(aPosition, 0.0, 1.0);
+  vTexCoord = (aPosition + 1.0) * 0.5;
+}
+`;
+
 const FRAGMENT_SHADER = `#version 100
 precision highp float;
 
 uniform sampler2D uTexture;
 uniform float uUseLevels;
 uniform float uLevelsMin;
-uniform float uLevelsGamma;
-uniform float uLevelsMax;
+uniform float uInvLevelsRange;
+uniform float uInvGamma;
 uniform float uDesaturate;
 uniform float uDoC2A;
 uniform float uDoCErase;
 uniform float uAlphaThresh;
-uniform float uAlphaFeather;
+uniform float uInvAlphaFeather;
 
 varying vec2 vTexCoord;
-
-float applyLevels(float v) {
-  float range = uLevelsMax - uLevelsMin;
-  if (range == 0.0) return 0.0;
-  float normalized = (v - uLevelsMin) / range;
-  normalized = clamp(normalized, 0.0, 1.0);
-  return pow(normalized, 1.0 / uLevelsGamma);
-}
 
 void main() {
   vec4 color = texture2D(uTexture, vTexCoord);
   vec3 rgb = color.rgb;
   float alpha = color.a;
 
-  // apply levels
-  if (uUseLevels > 0.5) {
-    rgb.r = applyLevels(rgb.r);
-    rgb.g = applyLevels(rgb.g);
-    rgb.b = applyLevels(rgb.b);
+  if (alpha <= 0.0) {
+    gl_FragColor = vec4(0.0);
+    return;
   }
 
-  // apply desaturation
+  // levels & gamma transformation
+  if (uUseLevels > 0.5) {
+    vec3 normalized = clamp((rgb - vec3(uLevelsMin)) * uInvLevelsRange, 0.0, 1.0);
+    rgb = pow(normalized, vec3(uInvGamma));
+  }
+
+  // luminance desaturation (Rec. 709 standard coefficients)
   if (uDesaturate > 0.5) {
-    float lum = dot(rgb, vec3(0.2118, 0.7154, 0.0745));
+    float lum = dot(rgb, vec3(0.2126, 0.7152, 0.0722));
     rgb = vec3(lum);
   }
 
-  // apply color-to-alpha or color erase
+  // Color-to-alpha or color erase
   float brightness = max(rgb.r, max(rgb.g, rgb.b));
 
   if (uDoCErase > 0.5) {
@@ -54,11 +62,10 @@ void main() {
       rgb = vec3(0.0);
     }
   } else if (uDoC2A > 0.5) {
-    if (brightness <= uAlphaThresh / 255.0) {
+    if (brightness <= uAlphaThresh) {
       alpha = 0.0;
-    } else if (brightness < (uAlphaThresh + uAlphaFeather) / 255.0) {
-      float featherRange = uAlphaFeather / 255.0;
-      float alphaFactor = (brightness - uAlphaThresh / 255.0) / featherRange;
+    } else {
+      float alphaFactor = min(1.0, (brightness - uAlphaThresh) * uInvAlphaFeather);
       alpha *= alphaFactor;
       if (alphaFactor > 0.0) {
         rgb /= alphaFactor;
@@ -70,25 +77,13 @@ void main() {
 }
 `;
 
-const VERTEX_SHADER = `#version 100
-precision highp float;
-
-attribute vec2 aPosition;
-varying vec2 vTexCoord;
-
-void main() {
-  gl_Position = vec4(aPosition, 0.0, 1.0);
-  vTexCoord = (aPosition + 1.0) / 2.0;
-}
-`;
-
 function createShaderProgram(gl) {
   const vertShader = gl.createShader(gl.VERTEX_SHADER);
   gl.shaderSource(vertShader, VERTEX_SHADER);
   gl.compileShader(vertShader);
 
   if (!gl.getShaderParameter(vertShader, gl.COMPILE_STATUS)) {
-    console.error('Vertex shader error:', gl.getShaderInfoLog(vertShader));
+    console.error('[worker] Vertex shader error:', gl.getShaderInfoLog(vertShader));
     return null;
   }
 
@@ -97,7 +92,7 @@ function createShaderProgram(gl) {
   gl.compileShader(fragShader);
 
   if (!gl.getShaderParameter(fragShader, gl.COMPILE_STATUS)) {
-    console.error('Fragment shader error:', gl.getShaderInfoLog(fragShader));
+    console.error('[worker] Fragment shader error:', gl.getShaderInfoLog(fragShader));
     return null;
   }
 
@@ -107,58 +102,52 @@ function createShaderProgram(gl) {
   gl.linkProgram(program);
 
   if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
-    console.error('Program link error:', gl.getProgramInfoLog(program));
+    console.error('[worker] Program link error:', gl.getProgramInfoLog(program));
     return null;
   }
 
   return program;
 }
 
-function processPixelsWebGL(imageData, config) {
-  try {
-    const canvas = new OffscreenCanvas(imageData.width, imageData.height);
-    const gl = canvas.getContext('webgl', { preserveDrawingBuffer: true, alpha: true });
+let glState = null;
 
-    if (!gl) {
-      console.warn('[worker] WebGL context unavailable, falling back to CPU processing');
-      return null;
+function initWebGL(width, height) {
+  if (glState) {
+    if (glState.width !== width || glState.height !== height) {
+      resizeWebGLState(width, height);
     }
+    return glState;
+  }
 
-    // create shader program
+  try {
+    const canvas = new OffscreenCanvas(width, height);
+    const gl = canvas.getContext('webgl', { 
+      preserveDrawingBuffer: true, 
+      alpha: true,
+      depth: false,
+      stencil: false,
+      antialias: false,
+      powerPreference: 'high-performance'
+    });
+
+    if (!gl) return null;
+
     const program = createShaderProgram(gl);
     if (!program) return null;
 
-    // create texture from ImageData
-    const texture = gl.createTexture();
-    gl.bindTexture(gl.TEXTURE_2D, texture);
-    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, imageData);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    const uniforms = {
+      uUseLevels: gl.getUniformLocation(program, 'uUseLevels'),
+      uLevelsMin: gl.getUniformLocation(program, 'uLevelsMin'),
+      uInvLevelsRange: gl.getUniformLocation(program, 'uInvLevelsRange'),
+      uInvGamma: gl.getUniformLocation(program, 'uInvGamma'),
+      uDesaturate: gl.getUniformLocation(program, 'uDesaturate'),
+      uDoC2A: gl.getUniformLocation(program, 'uDoC2A'),
+      uDoCErase: gl.getUniformLocation(program, 'uDoCErase'),
+      uAlphaThresh: gl.getUniformLocation(program, 'uAlphaThresh'),
+      uInvAlphaFeather: gl.getUniformLocation(program, 'uInvAlphaFeather'),
+      uTexture: gl.getUniformLocation(program, 'uTexture')
+    };
 
-    // create framebuffer
-    const framebuffer = gl.createFramebuffer();
-    gl.bindFramebuffer(gl.FRAMEBUFFER, framebuffer);
-
-    const rendertarget = gl.createTexture();
-    gl.bindTexture(gl.TEXTURE_2D, rendertarget);
-    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, imageData.width, imageData.height, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
-
-    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, rendertarget, 0);
-
-    if (gl.checkFramebufferStatus(gl.FRAMEBUFFER) !== gl.FRAMEBUFFER_COMPLETE) {
-      console.warn('[worker] Framebuffer incomplete, falling back to CPU');
-      return null;
-    }
-
-    // setup viewport and quad
-    gl.viewport(0, 0, imageData.width, imageData.height);
-    gl.useProgram(program);
-
-    // create and bind position buffer
     const posBuffer = gl.createBuffer();
     gl.bindBuffer(gl.ARRAY_BUFFER, posBuffer);
     gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 1, -1, -1, 1, 1, 1]), gl.STATIC_DRAW);
@@ -167,112 +156,179 @@ function processPixelsWebGL(imageData, config) {
     gl.vertexAttribPointer(aPosition, 2, gl.FLOAT, false, 0, 0);
     gl.enableVertexAttribArray(aPosition);
 
-    // set uniforms
-    const useLevels = config.levelsMin !== 0 || config.levelsMax !== 255 || config.levelsGamma !== 1.0;
-    gl.uniform1f(gl.getUniformLocation(program, 'uUseLevels'), useLevels ? 1.0 : 0.0);
-    gl.uniform1f(gl.getUniformLocation(program, 'uLevelsMin'), config.levelsMin / 255.0);
-    gl.uniform1f(gl.getUniformLocation(program, 'uLevelsGamma'), config.levelsGamma);
-    gl.uniform1f(gl.getUniformLocation(program, 'uLevelsMax'), config.levelsMax / 255.0);
-    gl.uniform1f(gl.getUniformLocation(program, 'uDesaturate'), config.desaturate ? 1.0 : 0.0);
-    gl.uniform1f(gl.getUniformLocation(program, 'uDoC2A'), config.c2a ? 1.0 : 0.0);
-    gl.uniform1f(gl.getUniformLocation(program, 'uDoCErase'), config.cErase ? 1.0 : 0.0);
-    gl.uniform1f(gl.getUniformLocation(program, 'uAlphaThresh'), config.alphaThresh);
-    gl.uniform1f(gl.getUniformLocation(program, 'uAlphaFeather'), config.alphaFeather);
+    const inputTexture = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, inputTexture);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
 
-    gl.uniform1i(gl.getUniformLocation(program, 'uTexture'), 0);
+    const renderTexture = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, renderTexture);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, width, height, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
 
-    // ensure texture is properly bound to unit 0
-    gl.activeTexture(gl.TEXTURE0);
-    gl.bindTexture(gl.TEXTURE_2D, texture);
+    const framebuffer = gl.createFramebuffer();
+    gl.bindFramebuffer(gl.FRAMEBUFFER, framebuffer);
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, renderTexture, 0);
 
-    // render
-    gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
-
-    // read pixels
-    const output = new Uint8ClampedArray(imageData.width * imageData.height * 4);
-    gl.readPixels(0, 0, imageData.width, imageData.height, gl.RGBA, gl.UNSIGNED_BYTE, output);
-
-    // verify we got valid data
-    if (!output || output.length === 0) {
-      console.warn('[worker] readPixels returned empty data, falling back to CPU');
+    if (gl.checkFramebufferStatus(gl.FRAMEBUFFER) !== gl.FRAMEBUFFER_COMPLETE) {
       return null;
     }
 
-    // cleanup
-    gl.deleteTexture(texture);
-    gl.deleteTexture(rendertarget);
-    gl.deleteFramebuffer(framebuffer);
-    gl.deleteBuffer(posBuffer);
-    gl.deleteProgram(program);
+    glState = {
+      canvas, gl, program, uniforms, posBuffer, inputTexture, renderTexture, framebuffer, width, height
+    };
 
-    return new ImageData(output, imageData.width, imageData.height);
+    return glState;
   } catch (err) {
-    console.warn('[worker] WebGL processing failed, falling back to CPU:', err.message);
+    console.warn('[worker] WebGL init failed:', err);
     return null;
   }
 }
 
-// CPU fallback
+function resizeWebGLState(width, height) {
+  if (!glState) return;
+  const { canvas, gl, renderTexture, framebuffer } = glState;
+  canvas.width = width;
+  canvas.height = height;
+
+  gl.bindTexture(gl.TEXTURE_2D, renderTexture);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, width, height, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+
+  gl.bindFramebuffer(gl.FRAMEBUFFER, framebuffer);
+  gl.viewport(0, 0, width, height);
+
+  glState.width = width;
+  glState.height = height;
+}
+
+function processPixelsWebGL(imageData, config) {
+  try {
+    const state = initWebGL(imageData.width, imageData.height);
+    if (!state) return null;
+
+    const { gl, program, uniforms, inputTexture, framebuffer, width, height } = state;
+
+    gl.viewport(0, 0, width, height);
+    gl.useProgram(program);
+
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, inputTexture);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, imageData);
+
+    gl.bindFramebuffer(gl.FRAMEBUFFER, framebuffer);
+
+    // pre-calculate uniforms
+    const lvMin = config.levelsMin / 255.0;
+    const lvMax = config.levelsMax / 255.0;
+    const range = lvMax - lvMin;
+    const invRange = range > 0.0001 ? 1.0 / range : 0.0;
+    const invGamma = config.levelsGamma > 0 ? 1.0 / config.levelsGamma : 1.0;
+    const useLevels = (config.levelsMin !== 0 || config.levelsMax !== 255 || config.levelsGamma !== 1.0);
+    const feather = Math.max(1.0, config.alphaFeather);
+
+    gl.uniform1f(uniforms.uUseLevels, useLevels ? 1.0 : 0.0);
+    gl.uniform1f(uniforms.uLevelsMin, lvMin);
+    gl.uniform1f(uniforms.uInvLevelsRange, invRange);
+    gl.uniform1f(uniforms.uInvGamma, invGamma);
+    gl.uniform1f(uniforms.uDesaturate, config.desaturate ? 1.0 : 0.0);
+    gl.uniform1f(uniforms.uDoC2A, config.c2a ? 1.0 : 0.0);
+    gl.uniform1f(uniforms.uDoCErase, config.cErase ? 1.0 : 0.0);
+    gl.uniform1f(uniforms.uAlphaThresh, config.alphaThresh / 255.0);
+    gl.uniform1f(uniforms.uInvAlphaFeather, 255.0 / feather);
+    gl.uniform1i(uniforms.uTexture, 0);
+
+    gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+
+    const output = new Uint8ClampedArray(width * height * 4);
+    gl.readPixels(0, 0, width, height, gl.RGBA, gl.UNSIGNED_BYTE, output);
+
+    return new ImageData(output, width, height);
+  } catch (err) {
+    console.warn('[worker] WebGL processing failed, falling back to CPU:', err);
+    return null;
+  }
+}
+
 function processPixelsCPU(imageData, config) {
   const d = imageData.data;
   const n = d.length;
 
-  const desat   = config.desaturate;
-  const lvMin   = config.levelsMin;
-  const lvGam   = config.levelsGamma;
-  const lvMax   = config.levelsMax;
-  const doC2A   = config.c2a;
-  const doCErase= config.cErase;
-  const thresh  = config.alphaThresh;
+  const desat = config.desaturate;
+  const lvMin = config.levelsMin;
+  const lvGam = config.levelsGamma;
+  const lvMax = config.levelsMax;
+  const doC2A = config.c2a;
+  const doCErase = config.cErase;
+  const thresh = config.alphaThresh;
   const feather = Math.max(1, config.alphaFeather);
+  const invFeather = 1 / feather;
 
-  if (lvMin !== 0 || lvMax !== 255 || lvGam !== 1.0) {
-    for (let i = 0; i < n; i += 4) {
-      d[i]   = Math.pow((d[i] - lvMin) / (lvMax - lvMin), 1 / lvGam) * 255;
-      d[i+1] = Math.pow((d[i+1] - lvMin) / (lvMax - lvMin), 1 / lvGam) * 255;
-      d[i+2] = Math.pow((d[i+2] - lvMin) / (lvMax - lvMin), 1 / lvGam) * 255;
+  const useLevels = (lvMin !== 0 || lvMax !== 255 || lvGam !== 1.0);
+  let lut = null;
+
+  if (useLevels) {
+    lut = new Uint8Array(256);
+    const invGamma = 1 / lvGam;
+    const range = lvMax - lvMin;
+    for (let i = 0; i < 256; i++) {
+      let v = i;
+      if (v < lvMin) v = lvMin;
+      else if (v > lvMax) v = lvMax;
+      lut[i] = range === 0 ? 0 : Math.pow((v - lvMin) / range, invGamma) * 255;
     }
   }
 
-  if (desat) {
-    for (let i = 0; i < n; i += 4) {
-      const lum = (54 * d[i] + 183 * d[i+1] + 19 * d[i+2]) >> 8;
-      d[i] = d[i+1] = d[i+2] = lum;
-    }
-  }
+  for (let i = 0; i < n; i += 4) {
+    let a = d[i + 3];
+    if (a === 0) continue; // skip zero alpha pixels instantly
 
-  if (doCErase) {
-    for (let i = 0; i < n; i += 4) {
-      let r = d[i], g = d[i+1], b = d[i+2];
-      let brightness = r > g ? (r > b ? r : b) : (g > b ? g : b);
+    let r = d[i], g = d[i + 1], b = d[i + 2];
+
+    if (useLevels) {
+      r = lut[r];
+      g = lut[g];
+      b = lut[b];
+    }
+
+    if (desat) {
+      const lum = (54 * r + 183 * g + 19 * b) >> 8;
+      r = g = b = lum;
+    }
+
+    if (doCErase) {
+      const brightness = r > g ? (r > b ? r : b) : (g > b ? g : b);
       const alphaFactor = brightness / 255;
-      d[i+3] = (alphaFactor * d[i+3]) | 0;
+      a = (alphaFactor * a) | 0;
       if (alphaFactor > 0) {
         const norm = 1 / alphaFactor;
-        d[i]   = Math.min(255, r * norm) | 0;
-        d[i+1] = Math.min(255, g * norm) | 0;
-        d[i+2] = Math.min(255, b * norm) | 0;
+        r = Math.min(255, (r * norm) | 0);
+        g = Math.min(255, (g * norm) | 0);
+        b = Math.min(255, (b * norm) | 0);
       } else {
-        d[i] = d[i+1] = d[i+2] = 0;
+        r = g = b = 0;
       }
-    }
-  } else if (doC2A) {
-    for (let i = 0; i < n; i += 4) {
-      let r = d[i], g = d[i+1], b = d[i+2];
-      let brightness = r > g ? (r > b ? r : b) : (g > b ? g : b);
+    } else if (doC2A) {
+      const brightness = r > g ? (r > b ? r : b) : (g > b ? g : b);
       if (brightness <= thresh) {
-        d[i+3] = 0;
+        a = 0;
       } else if (brightness < thresh + feather) {
-        const alphaFactor = (brightness - thresh) / feather;
-        d[i+3] = (alphaFactor * 255) | 0;
+        const alphaFactor = (brightness - thresh) * invFeather;
+        a = (alphaFactor * a) | 0;
         if (alphaFactor > 0) {
           const norm = 1 / alphaFactor;
-          d[i]   = Math.min(255, r * norm) | 0;
-          d[i+1] = Math.min(255, g * norm) | 0;
-          d[i+2] = Math.min(255, b * norm) | 0;
+          r = Math.min(255, (r * norm) | 0);
+          g = Math.min(255, (g * norm) | 0);
+          b = Math.min(255, (b * norm) | 0);
         }
       }
     }
+
+    d[i] = r; d[i + 1] = g; d[i + 2] = b; d[i + 3] = a;
   }
 
   return imageData;
@@ -321,13 +377,17 @@ self.onmessage = async (event) => {
       ctx.globalAlpha = opacity;
       ctx.globalCompositeOperation = blendMode;
       ctx.translate(scaledCenterX, scaledCenterY);
-      ctx.rotate(stormRotation * Math.PI / 180);
+      ctx.rotate((stormRotation * Math.PI) / 180);
       ctx.scale(flipH ? -1 : 1, flipV ? -1 : 1);
       ctx.drawImage(stormBitmap, -scaledRenderedW / 2, -scaledRenderedH / 2, scaledRenderedW, scaledRenderedH);
       ctx.restore();
     }
 
     const blob = await exportCanvas.convertToBlob({ type: mime, quality });
+
+    if (mapBitmap && typeof mapBitmap.close === 'function') mapBitmap.close();
+    if (stormBitmap && typeof stormBitmap.close === 'function') stormBitmap.close();
+
     self.postMessage({ type: 'export_done', blob });
     return;
   }
@@ -335,7 +395,6 @@ self.onmessage = async (event) => {
   const { imageData, config } = event.data;
   if (!imageData) return;
 
-  // try WebGL first, fallback to CPU
   let processedData = processPixelsWebGL(imageData, config);
   if (!processedData) {
     processedData = processPixelsCPU(imageData, config);
